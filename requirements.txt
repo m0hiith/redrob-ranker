@@ -1,0 +1,6 @@
+# Core pipeline runs on pure stdlib (lexical TF-IDF fallback for semantic search).
+#
+# For TRUE semantic search (Stage 3), install sentence-transformers. The pipeline
+# auto-detects it and upgrades from the lexical fallback to all-MiniLM-L6-v2.
+sentence-transformers>=2.6.0
+numpy>=1.24.0
