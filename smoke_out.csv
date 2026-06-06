@@ -1,4 +1,4 @@
 candidate_id,rank,score,reasoning
-CAND_0000031,1,0.9297,"Recommendation Systems Engineer, 6.0y | semantic fit 100% | 6/8 must-haves (Embeddings, Retrieval Systems, Vector Databases) | response 91%, engagement 75%."
-CAND_0000001,2,0.3172,"Backend Engineer, 6.9y | semantic fit 23% | 4/8 must-haves (Embeddings, Vector Databases, Python) | response 34%, engagement 55% | flags: consulting-only."
-CAND_0000002,3,0.2373,"Operations Manager, 12.5y | semantic fit 2% | 0/8 must-haves (none) | response 29%, engagement 46% | flags: consulting-only, no-production."
+CAND_0000031,1,0.8456,"Recommendation Systems Engineer at Swiggy with 6.0y exp; covers Embeddings, Retrieval Systems, Vector Databases; highly responsive (91%); strong search depth (3/4 pillars); Hyderabad, Telangana-based."
+CAND_0000001,2,0.4828,"Backend Engineer at Mindtree with 6.9y exp; covers Embeddings, Vector Databases, Python; low response rate (34%); concern: consulting-only background; Toronto-based."
+CAND_0000002,3,0.4434,"Operations Manager at Wipro with 12.5y exp; covers no core skill matches; low response rate (29%); concern: consulting-only background; no production deployment signals; Chennai, Tamil Nadu-based."

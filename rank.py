@@ -11,7 +11,7 @@ seven stages:
     3. Semantic Search ....... sentence-transformer cosine fit (lexical fallback)
     4. Career Pattern ........ recruiter-style trajectory & negative-signal analysis
     5. Behavioral Signals .... Redrob platform engagement & reliability
-    6. Weighted Ranker ....... final_score = 0.45 sem + 0.25 career + 0.15 behav
+    6. Weighted Ranker ....... final_score = 0.40 sem + 0.30 career + 0.15 behav
                                             + 0.10 location + 0.05 availability
     7. Honeypot Filter ....... fake-candidate detection → forced to the bottom
 
@@ -28,12 +28,13 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import logging
 import math
 import re
 from collections import Counter
 from datetime import date
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 # ─── Stage 1: Job Description (weighted requirements) ─────────────────────────
 # Extracted directly from the JD. Edit this block to target a different role.
@@ -80,14 +81,16 @@ JOB_DESCRIPTION: Dict = {
 
 # ─── Stage 6: Final score weights (sum to 1.0) ───────────────────────────────
 WEIGHTS = {
-    "semantic":     0.45,
-    "career":       0.25,
+    "semantic":     0.40,   # raised career → reduced semantic by 0.05
+    "career":       0.30,   # boosted: now includes YoE modifier; stronger trajectory signal
     "behavioral":   0.15,
     "location":     0.10,
     "availability": 0.05,
 }
 
-REFERENCE_DATE = date(2026, 6, 5)
+logger = logging.getLogger(__name__)
+
+REFERENCE_DATE = date.today()
 
 # ─── Concept ontology ────────────────────────────────────────────────────────
 # Maps each must-have / good-to-have requirement to the skill/keyword surface
@@ -97,31 +100,63 @@ CONCEPTS: Dict[str, set] = {
     "Embeddings": {
         "embeddings", "sentence transformers", "sentence-transformers",
         "word2vec", "glove", "text embeddings", "bge", "minilm",
+        # Encoder architectures
+        "bi encoder", "bi-encoder", "biencoder", "dual encoder",
+        "cross encoder", "cross-encoder", "crossencoder",
+        # Late-interaction & passage-retrieval models
+        "colbert", "dpr", "e5", "gte",
     },
     "Retrieval Systems": {
         "information retrieval", "retrieval", "rag",
         "retrieval augmented generation", "bm25", "semantic search",
         "haystack", "dense retrieval", "elasticsearch", "opensearch",
+        # Search engines
+        "solr", "vespa",
+        # Retrieval paradigms
+        "hybrid search", "sparse retrieval",
+        "dense passage retrieval", "dpr", "colbert",
+        "two-stage retrieval",
     },
     "Vector Databases": {
         "vector search", "vector database", "faiss", "pinecone",
         "weaviate", "qdrant", "milvus", "pgvector", "chroma",
+        # Also used as vector/ANN backends
+        "vespa",
+        # ANN indexing
+        "hnsw", "ann", "approximate nearest neighbor",
+        "approximate nearest neighbours",
     },
     "Ranking/Search Systems": {
         "ranking", "search", "recommendation systems", "recommender",
         "learning to rank", "learning-to-rank", "ltr", "xgboost",
         "lightgbm", "search engineer", "relevance",
+        # Reranking
+        "reranking", "re-ranking", "reranker", "re-ranker",
+        "cross encoder", "cross-encoder",
+        # Multi-stage pipeline terminology
+        "first stage retrieval", "second stage ranking",
     },
     "Python": {"python"},
     "Evaluation Metrics (NDCG, MRR, MAP)": {
         "ndcg", "mrr", "map", "evaluation metrics", "offline evaluation",
-        "ab test", "a/b test", "precision@k", "recall@k",
+        "ab test", "a/b test", "a/b testing", "ab testing",
+        "precision@k", "recall@k", "online evaluation",
     },
     "Production ML": {
         "mlops", "mlflow", "kubeflow", "bentoml", "production", "deployment",
         "serving", "model serving", "weights & biases", "wandb",
     },
-    "Product Company Experience": set(),  # derived from industry, not skills
+    "Product Company Experience": {
+        # System types that signal real product-ML work
+        "ranking system", "recommendation system", "recommendation engine",
+        "retrieval system", "search infrastructure", "search platform",
+        "search ranking", "consumer product", "marketplace",
+        # Scale / production signals
+        "production ml", "real-time serving", "at scale",
+        "shipped to production", "feature launch",
+        # Experimentation (product companies run A/B tests; consulting firms rarely do)
+        "a/b testing", "experimentation platform", "online metrics",
+    },
     # ── Good-to-have ──
     "LLM Fine-tuning": {
         "fine-tuning llms", "fine-tuning", "peft", "lora", "qlora", "sft", "rlhf",
@@ -147,13 +182,34 @@ SERVICES_COMPANIES = {
 }
 SERVICES_INDUSTRIES = {"it services", "consulting", "staffing", "outsourcing"}
 
+# Description phrases that suggest real product-ML work even at services firms.
+# Used by _product_company_signal for partial-credit when industry tag is missing/wrong.
+_PRODUCT_DESC_SIGNALS = {
+    "ranking system", "recommendation system", "recommendation engine",
+    "retrieval system", "search infrastructure", "search ranking",
+    "consumer product", "marketplace product",
+    "real-time serving", "at scale", "shipped to production",
+    "a/b testing", "online experiment", "feature launch",
+    "production ml system", "production serving",
+}
+
 # Skill surfaces that are purely Computer Vision (the "CV only" negative signal).
 CV_SKILLS = {
     "opencv", "yolo", "cnn", "object detection", "image classification",
     "image segmentation", "gans", "computer vision",
 }
 
+# The four pillars that define a full-stack search engineer.
+# Covering all four separates specialists from tool-mentioners.
+_SEARCH_PILLARS = (
+    "Retrieval Systems",
+    "Ranking/Search Systems",
+    "Evaluation Metrics (NDCG, MRR, MAP)",
+    "Production ML",
+)
+
 PROFICIENCY = {"beginner": 0.25, "intermediate": 0.50, "advanced": 0.80, "expert": 1.00}
+_VALID_PROFICIENCIES = frozenset(PROFICIENCY)
 
 STOPWORDS = {
     "the", "a", "an", "and", "or", "of", "to", "in", "on", "for", "with", "at",
@@ -164,6 +220,43 @@ STOPWORDS = {
 
 def _clamp(v: float, lo: float = 0.0, hi: float = 1.0) -> float:
     return max(lo, min(hi, v))
+
+
+def _yoe_score(yoe: float) -> float:
+    """
+    Smooth seniority-fit score in [0, 1] for a Search/Ranking ML IC role.
+
+    Sweet spot: 5–9 years (score ≥ 0.90).  Peak at 7 years (score = 1.00).
+    Formula: piecewise linear between key breakpoints — no hard cliffs.
+
+        0y → 0.20  (floor; some signal from other dimensions)
+        3y → 0.60  (junior but capable)
+        5y → 0.90  (entering ideal band)
+        7y → 1.00  (peak: enough production depth, not overqualified)
+        9y → 0.90  (exiting ideal band)
+       14y → 0.70  (senior: valuable but risk of overqualified/overpriced)
+      15y+ → 0.70  (floor for very experienced candidates)
+
+    Used as a multiplicative modifier inside score_career:
+        career_score *= (0.80 + 0.20 * _yoe_score(yoe))
+    This bounds the YoE effect to ±20% of the raw career score, preserving
+    the primacy of actual job-trajectory signals.
+    """
+    yoe = float(yoe or 0)
+    if yoe <= 0:
+        return 0.20
+    if yoe <= 3:
+        return 0.20 + 0.40 * (yoe / 3.0)
+    if yoe < 5:
+        # strictly < 5 so yoe=5 falls into the next branch and returns exactly 0.90
+        return 0.60 + 0.30 * ((yoe - 3) / 2.0)
+    if yoe <= 7:
+        return 0.90 + 0.10 * ((yoe - 5) / 2.0)
+    if yoe <= 9:
+        return 1.00 - 0.10 * ((yoe - 7) / 2.0)
+    if yoe <= 14:
+        return 0.90 - 0.20 * ((yoe - 9) / 5.0)
+    return 0.70
 
 
 # ─── Stage 3: Semantic Search ─────────────────────────────────────────────────
@@ -181,12 +274,50 @@ class Embedder:
     def __init__(self) -> None:
         self.mode = "lexical"
         self._model = None
-        try:
-            from sentence_transformers import SentenceTransformer  # noqa: WPS433
-            self._model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
-            self.mode = "semantic"
-        except Exception:  # missing dep, no model cache, no network — degrade.
-            self._model = None
+        self._model_id: Optional[str] = None
+        self._query_prefix: str = ""
+        # None  → semantic mode loaded successfully.
+        # str   → human-readable reason(s) the neural model could not be loaded;
+        #         callers can inspect this to distinguish modes and diagnose failures.
+        self.load_error: Optional[str] = None
+
+        # NOTE: hosted API calls (Azure OpenAI, etc.) are banned during the ranking
+        # step by the submission spec. Only local CPU-resident models are allowed.
+        # Priority: BAAI/bge-small-en-v1.5 > all-MiniLM-L6-v2 > TF-IDF lexical.
+        # BGE models require an asymmetric prefix on the query side only.
+        _BGE_QUERY_PREFIX = "Represent this sentence for searching relevant passages: "
+        _errors: List[str] = []
+        for model_id in (
+            "BAAI/bge-small-en-v1.5",
+            "sentence-transformers/all-MiniLM-L6-v2",
+        ):
+            try:
+                from sentence_transformers import SentenceTransformer  # noqa: WPS433
+                self._model = SentenceTransformer(model_id)
+                self._model_id = model_id
+                self._query_prefix = (
+                    _BGE_QUERY_PREFIX if model_id.startswith("BAAI/bge") else ""
+                )
+                self.mode = "semantic"
+                logger.info("Embedder: loaded %s in semantic mode", model_id)
+                break
+            except ImportError as exc:
+                # Package absent — no point trying the next model ID.
+                msg = f"sentence-transformers not installed: {exc}"
+                _errors.append(msg)
+                logger.debug("Embedder: %s — skipping all neural models", msg)
+                break
+            except Exception as exc:
+                # Model-specific failure (network, corrupt cache, etc.) — try next.
+                msg = f"{model_id}: {type(exc).__name__}: {exc}"
+                _errors.append(msg)
+                logger.warning("Embedder: failed to load %s — %s", model_id, exc)
+
+        if self.mode == "lexical":
+            self.load_error = "; ".join(_errors) or "sentence-transformers unavailable"
+            logger.warning(
+                "Embedder: falling back to TF-IDF lexical mode — %s", self.load_error
+            )
 
     def similarities(self, jd_doc: str, cand_docs: List[str]) -> List[float]:
         if not cand_docs:
@@ -196,22 +327,19 @@ class Embedder:
             if self.mode == "semantic"
             else self._lexical(jd_doc, cand_docs)
         )
-        # Normalize by the cohort max so relevance occupies a usable range and
-        # the 0.45 weight has real ranking influence. Absolute cosine magnitude
-        # is irrelevant for ordering within a single JD's candidate pool.
-        top = max(raw)
-        if top <= 1e-9:
-            return raw
-        return [_clamp(s / top) for s in raw]
+        return [_clamp(s) for s in raw]
 
     def _semantic(self, jd_doc: str, cand_docs: List[str]) -> List[float]:
         import numpy as np  # bundled with sentence-transformers
 
-        emb = self._model.encode(
-            [jd_doc] + cand_docs, normalize_embeddings=True, show_progress_bar=False
+        query = self._query_prefix + jd_doc
+        jd_emb = np.asarray(
+            self._model.encode([query], normalize_embeddings=True, show_progress_bar=False)
         )
-        emb = np.asarray(emb)
-        sims = emb[1:] @ emb[0]
+        cand_emb = np.asarray(
+            self._model.encode(cand_docs, normalize_embeddings=True, show_progress_bar=False)
+        )
+        sims = cand_emb @ jd_emb[0]
         return [_clamp(float(s)) for s in sims]
 
     def _lexical(self, jd_doc: str, cand_docs: List[str]) -> List[float]:
@@ -305,7 +433,13 @@ def concept_coverage(c: Dict, jd: Dict) -> Dict[str, float]:
     "Product Company Experience" is special-cased from industry/company data.
     """
     blob = candidate_text_blob(c)
-    skill_names = {s.get("name", "").lower() for s in c.get("skills", [])}
+    skills_list = c.get("skills", [])
+    skill_names = {s.get("name", "").lower() for s in skills_list}
+    # Map skill name → endorsement count for the boost below.
+    skill_endorsements = {
+        s.get("name", "").lower(): (s.get("endorsements") or 0)
+        for s in skills_list
+    }
     coverage: Dict[str, float] = {}
 
     requirements = jd["must_have"] + jd["good_to_have"]
@@ -318,6 +452,9 @@ def concept_coverage(c: Dict, jd: Dict) -> Dict[str, float]:
         for surface in surfaces:
             if surface in skill_names:
                 hit = max(hit, 1.0)          # explicit skill = strong
+                # Endorsed skill on a core concept → extra credibility boost.
+                if skill_endorsements.get(surface, 0) >= 5:
+                    hit = min(hit + 0.10, 1.0)
             elif surface in blob:
                 hit = max(hit, 0.6)          # mentioned in text = moderate
         coverage[req] = hit
@@ -333,10 +470,15 @@ def _product_company_signal(c: Dict) -> float:
     for job in history:
         ind = (job.get("industry", "") or "").lower()
         comp = (job.get("company", "") or "").lower()
+        desc = (job.get("description", "") or "").lower()
         if ind in PRODUCT_INDUSTRIES and not any(s in comp for s in SERVICES_COMPANIES):
             best = max(best, 1.0)
         elif ind in PRODUCT_INDUSTRIES:
             best = max(best, 0.6)
+        elif any(sig in desc for sig in _PRODUCT_DESC_SIGNALS):
+            # Services/consulting firm but description shows product-ML work style
+            # (e.g., shipped ranking system for a client's product). Partial credit.
+            best = max(best, 0.4)
     return best
 
 
@@ -345,12 +487,24 @@ def engineer_features(c: Dict, jd: Dict, coverage: Dict[str, float]) -> Dict:
     p = c.get("profile", {})
     must = jd["must_have"]
     must_covered = sum(1 for r in must if coverage.get(r, 0) >= 0.6)
+    n_pillars = sum(1 for p_ in _SEARCH_PILLARS if coverage.get(p_, 0) >= 0.6)
     return {
         "years_exp": p.get("years_of_experience", 0),
         "must_have_covered": must_covered,
         "must_have_total": len(must),
         "covered_concepts": [r for r in must if coverage.get(r, 0) >= 0.6],
+        "n_search_pillars": n_pillars,
     }
+
+
+def _search_depth_bonus(coverage: Dict[str, float]) -> float:
+    """
+    Reward breadth across the four search-engineering pillars.
+    Each pillar covered at ≥ 0.6 adds 0.02 to the career score (max +0.08).
+    Separates 'mentioned FAISS once' from a genuine full-stack search engineer.
+    """
+    n = sum(1 for p in _SEARCH_PILLARS if coverage.get(p, 0) >= 0.6)
+    return n / 4.0 * 0.08
 
 
 # ─── Stage 4: Career Pattern Analysis (think like a recruiter) ────────────────
@@ -371,6 +525,8 @@ def score_career(c: Dict, coverage: Dict[str, float]) -> Tuple[float, List[str]]
         "ml engineer", "machine learning engineer", "ai engineer",
         "applied ml", "nlp engineer", "research engineer", "data scientist",
         "mlops engineer", "search engineer", "recommendation systems engineer",
+        "relevance engineer", "ranking engineer", "retrieval engineer",
+        "applied scientist", "search platform engineer", "vector search engineer",
     }
 
     weighted_sum = 0.0
@@ -395,8 +551,14 @@ def score_career(c: Dict, coverage: Dict[str, float]) -> Tuple[float, List[str]]
                          not any(s in company for s in SERVICES_COMPANIES)) else 0.35
 
         job_score = title_s * 0.40 + desc_s * 0.35 + prod_s * 0.25
-        weighted_sum += job_score * w
-        weight_total += w
+
+        # Duration weight: a 2-year deep dive outweighs a 3-month gig.
+        # Unknown/zero duration treated as 12 months (neutral-ish).
+        dur_months = (job.get("duration_months", 0) or 0)
+        duration_weight = min((dur_months if dur_months > 0 else 12) / 24.0, 1.0)
+        combined_w = w * duration_weight
+        weighted_sum += job_score * combined_w
+        weight_total += combined_w
 
     score = _clamp(weighted_sum / max(weight_total, 1.0))
 
@@ -404,6 +566,15 @@ def score_career(c: Dict, coverage: Dict[str, float]) -> Tuple[float, List[str]]
     cur = history[0]
     if cur.get("is_current") and coverage.get("Production ML", 0) >= 0.6:
         score = _clamp(score + 0.05)
+
+    # Depth bonus: reward covering all four search-engineering pillars.
+    score = _clamp(score + _search_depth_bonus(coverage))
+
+    # YoE modifier: scales career ±20% based on seniority fit.
+    # Applied before negative signals so that trajectory penalties compound
+    # naturally on top of the seniority-adjusted base.
+    yoe = float((c.get("profile") or {}).get("years_of_experience", 0) or 0)
+    score = _clamp(score * (0.80 + 0.20 * _yoe_score(yoe)))
 
     score, flags = _apply_negative_signals(c, coverage, history, score)
     return score, flags
@@ -590,12 +761,15 @@ def detect_honeypot(c: Dict) -> Tuple[bool, List[str]]:
 
     # Expert skills with no real tenure. Many experts where *every* one has zero
     # usage is fabrication (hard); a partial pattern is merely suspicious (soft).
+    # Gap closed: previously 9 experts / 8 zero-usage triggered neither branch
+    # because the hard check required ALL zero and the soft check required >10.
     expert = [sk for sk in skills if sk.get("proficiency") == "expert"]
     expert_no_use = [sk for sk in expert if (sk.get("duration_months", 0) or 0) == 0]
-    if len(expert) >= 8 and len(expert_no_use) == len(expert):
+    if len(expert) >= 8 and len(expert_no_use) >= len(expert) - 1:
+        # All, or all-but-one, expert skills with zero usage → hard fabrication signal.
         hard += 1
-        reasons.append(f"{len(expert)} expert skills, all with zero usage")
-    elif len(expert) > 10 and len(expert_no_use) >= 5:
+        reasons.append(f"{len(expert_no_use)}/{len(expert)} expert skills with zero usage")
+    elif len(expert) >= 6 and len(expert_no_use) >= 5:
         soft += 1
         reasons.append("many expert skills with zero usage")
 
@@ -626,24 +800,57 @@ def build_reasoning(
 ) -> str:
     p = c.get("profile", {})
     s = c.get("redrob_signals", {})
+    history = c.get("career_history", []) or []
+
+    if is_honeypot:
+        detail = "; ".join(honeypot_reasons) or "fabricated profile"
+        return f"HONEYPOT — {detail}."
+
     title = p.get("current_title", "Unknown")
     yoe = p.get("years_of_experience", 0) or 0
     rr = s.get("recruiter_response_rate", 0) or 0
-    covered = features["must_have_covered"]
-    total = features["must_have_total"]
-    top = ", ".join(features["covered_concepts"][:3]) or "none"
+    company = (history[0].get("company", "") if history else "") or ""
+    location = p.get("city", "") or p.get("location", "") or p.get("country", "") or ""
 
-    if is_honeypot:
-        return f"⚠ HONEYPOT — {('; '.join(honeypot_reasons)) or 'fabricated profile'}."
+    # Skill evidence: list concepts actually covered in candidate's profile.
+    covered_concepts = features["covered_concepts"]
+    skill_phrase = ", ".join(covered_concepts[:3]) if covered_concepts else "no core skill matches"
 
-    base = (
-        f"{title}, {yoe:.1f}y | semantic fit {semantic:.0%} | "
-        f"{covered}/{total} must-haves ({top}) | response {rr:.0%}, "
-        f"engagement {behavioral:.0%}"
-    )
+    # Build a single readable sentence specific to this candidate.
+    at_company = f" at {company}" if company else ""
+    loc_phrase = f"; {location}-based" if location else ""
+
+    parts = [f"{title}{at_company} with {yoe:.1f}y exp; covers {skill_phrase}"]
+
+    if rr >= 0.70:
+        parts.append(f"highly responsive ({rr:.0%})")
+    elif rr >= 0.40:
+        parts.append(f"moderate responsiveness ({rr:.0%})")
+    else:
+        parts.append(f"low response rate ({rr:.0%})")
+
+    gh = s.get("github_activity_score", -1)
+    if gh is not None and gh >= 60:
+        parts.append("active GitHub")
+
+    n_pillars = features.get("n_search_pillars", 0)
+    if n_pillars == 4:
+        parts.append("full-stack search depth (4/4 pillars)")
+    elif n_pillars == 3:
+        parts.append("strong search depth (3/4 pillars)")
+
     if career_flags:
-        base += f" | flags: {', '.join(career_flags)}"
-    return base + "."
+        flag_map = {
+            "consulting-only": "consulting-only background",
+            "pure-research": "research-only, limited production evidence",
+            "cv-only": "Computer Vision focus — limited retrieval/ranking depth",
+            "langchain-only": "LangChain usage without deeper retrieval stack",
+            "no-production": "no production deployment signals",
+        }
+        concerns = "; ".join(flag_map.get(f, f) for f in career_flags)
+        parts.append(f"concern: {concerns}")
+
+    return ("; ".join(parts) + loc_phrase + ".").replace(";;", ";")  # guard dupes
 
 
 # ─── Main Pipeline ────────────────────────────────────────────────────────────
@@ -672,6 +879,14 @@ def rank_candidates(candidates: List[Dict], jd: Dict, embedder: Embedder) -> Lis
             availability * WEIGHTS["availability"]
         )
 
+        # Suppress honeypot scores to 0.0.  Keeping the raw score would mislead
+        # NDCG/MRR evaluation (a well-crafted fake could report 0.85 at rank 90).
+        # Zero is still within the [0,1] CSV spec and, combined with the
+        # "HONEYPOT — " reasoning prefix, gives downstream consumers two
+        # independent signals without breaking the 4-column format.
+        if is_honeypot:
+            final = 0.0
+
         scored.append({
             "candidate_id": c["candidate_id"],
             "score": round(final, 4),
@@ -680,7 +895,22 @@ def rank_candidates(candidates: List[Dict], jd: Dict, embedder: Embedder) -> Lis
                 career_flags, hp_reasons, is_honeypot,
             ),
             "_honeypot": is_honeypot,
+            "_breakdown": {
+                "semantic":     round(semantic,     4),
+                "career":       round(career,       4),
+                "behavioral":   round(behavioral,   4),
+                "location":     round(location,     4),
+                "availability": round(availability, 4),
+                "final":        round(final,        4),
+            },
         })
+
+    hp_count = sum(1 for r in scored if r["_honeypot"])
+    if hp_count:
+        logger.warning(
+            "Honeypot filter: %d / %d candidate(s) flagged and score-suppressed",
+            hp_count, len(scored),
+        )
 
     # Honeypots always sort below legitimate candidates; then by score desc,
     # then candidate_id asc for a stable, reproducible tie-break.
@@ -693,32 +923,207 @@ def rank_candidates(candidates: List[Dict], jd: Dict, embedder: Embedder) -> Lis
             "rank": rank,
             "score": row["score"],
             "reasoning": row["reasoning"],
+            "_breakdown": row.get("_breakdown", {}),
         })
     return results
+
+
+# ─── Stage 0: Schema Validation ───────────────────────────────────────────────
+
+def validate_candidate(c: object) -> Tuple[bool, List[str]]:
+    """
+    Validate a candidate record before scoring. Returns (is_valid, issues).
+
+    is_valid=False  → structural failure; record must be rejected.
+    is_valid=True   → record may be scored; non-empty issues are warnings only.
+
+    Fatal (reject):
+      * not a dict
+      * candidate_id missing or not a non-empty string
+      * profile / skills / career_history / redrob_signals present but wrong type
+
+    Warning (score with caveats):
+      * required top-level key absent (downstream .get() defaults kick in)
+      * years_of_experience negative or non-numeric
+      * skill proficiency not in {beginner, intermediate, advanced, expert}
+      * skill / job duration_months negative
+      * rate fields (response rate, etc.) outside [0, 1]
+      * profile_completeness_score outside [0, 100]
+    """
+    if not isinstance(c, dict):
+        return False, [f"record is not a dict (got {type(c).__name__})"]
+
+    issues: List[str] = []
+    fatal = False
+
+    # ── candidate_id ──────────────────────────────────────────────────────────
+    cid = c.get("candidate_id")
+    if cid is None:
+        issues.append("missing candidate_id")
+        fatal = True
+    elif not isinstance(cid, str) or not cid.strip():
+        issues.append(f"candidate_id must be a non-empty string, got {cid!r}")
+        fatal = True
+
+    # ── profile ───────────────────────────────────────────────────────────────
+    profile = c.get("profile")
+    if profile is None:
+        issues.append("missing profile (defaults to {})")
+    elif not isinstance(profile, dict):
+        issues.append(f"profile must be a dict, got {type(profile).__name__}")
+        fatal = True
+    else:
+        yoe = profile.get("years_of_experience")
+        if yoe is not None and (not isinstance(yoe, (int, float)) or yoe < 0):
+            issues.append(f"profile.years_of_experience invalid: {yoe!r}")
+
+    # ── skills ────────────────────────────────────────────────────────────────
+    skills = c.get("skills")
+    if skills is None:
+        issues.append("missing skills (defaults to [])")
+    elif not isinstance(skills, list):
+        issues.append(f"skills must be a list, got {type(skills).__name__}")
+        fatal = True
+    else:
+        for i, sk in enumerate(skills):
+            if not isinstance(sk, dict):
+                issues.append(f"skills[{i}] is not a dict")
+                continue
+            name = sk.get("name")
+            if not name or not isinstance(name, str):
+                issues.append(f"skills[{i}].name missing or not a string")
+            prof = sk.get("proficiency")
+            if prof is not None and prof not in _VALID_PROFICIENCIES:
+                issues.append(f"skills[{i}].proficiency unrecognised: {prof!r}")
+            dur = sk.get("duration_months")
+            if dur is not None and (not isinstance(dur, (int, float)) or dur < 0):
+                issues.append(f"skills[{i}].duration_months invalid: {dur!r}")
+
+    # ── career_history ────────────────────────────────────────────────────────
+    career = c.get("career_history")
+    if career is None:
+        issues.append("missing career_history (defaults to [])")
+    elif not isinstance(career, list):
+        issues.append(f"career_history must be a list, got {type(career).__name__}")
+        fatal = True
+    else:
+        for i, job in enumerate(career):
+            if not isinstance(job, dict):
+                issues.append(f"career_history[{i}] is not a dict")
+                continue
+            dur = job.get("duration_months")
+            if dur is not None and (not isinstance(dur, (int, float)) or dur < 0):
+                issues.append(f"career_history[{i}].duration_months invalid: {dur!r}")
+
+    # ── redrob_signals ────────────────────────────────────────────────────────
+    signals = c.get("redrob_signals")
+    if signals is None:
+        issues.append("missing redrob_signals (defaults to {})")
+    elif not isinstance(signals, dict):
+        issues.append(f"redrob_signals must be a dict, got {type(signals).__name__}")
+        fatal = True
+    else:
+        for rate_key in (
+            "recruiter_response_rate",
+            "interview_completion_rate",
+            "offer_acceptance_rate",
+        ):
+            v = signals.get(rate_key)
+            if v is not None and isinstance(v, (int, float)) and not (0.0 <= v <= 1.0):
+                issues.append(f"redrob_signals.{rate_key} out of range [0, 1]: {v!r}")
+        completeness = signals.get("profile_completeness_score")
+        if (
+            completeness is not None
+            and isinstance(completeness, (int, float))
+            and not (0 <= completeness <= 100)
+        ):
+            issues.append(
+                f"redrob_signals.profile_completeness_score out of range [0, 100]: {completeness!r}"
+            )
+
+    return not fatal, issues
 
 
 def load_candidates(path: str) -> List[Dict]:
     p = Path(path)
     text = p.read_text(encoding="utf-8")
     if p.suffix.lower() == ".jsonl":
-        return [json.loads(ln) for ln in text.splitlines() if ln.strip()]
-    data = json.loads(text)
-    return data if isinstance(data, list) else [data]
+        raw: List = []
+        for ln_no, ln in enumerate(text.splitlines(), 1):
+            if not ln.strip():
+                continue
+            try:
+                raw.append(json.loads(ln))
+            except json.JSONDecodeError as exc:
+                logger.error("Line %d: JSON parse error — %s", ln_no, exc)
+    else:
+        data = json.loads(text)
+        raw = data if isinstance(data, list) else [data]
+
+    valid: List[Dict] = []
+    rejected = 0
+    for i, record in enumerate(raw):
+        cid = (
+            record.get("candidate_id", f"<record {i}>")
+            if isinstance(record, dict)
+            else f"<record {i}>"
+        )
+        is_valid, issues = validate_candidate(record)
+        for msg in issues:
+            if is_valid:
+                logger.warning("Candidate %s: %s", cid, msg)
+            else:
+                logger.error("Candidate %s: %s", cid, msg)
+        if is_valid:
+            valid.append(record)
+        else:
+            rejected += 1
+            logger.error("Candidate %s REJECTED — structural validation failed", cid)
+
+    if rejected:
+        logger.warning(
+            "%d / %d candidate record(s) rejected; %d will be scored",
+            rejected, len(raw), len(valid),
+        )
+    return valid
 
 
 def write_csv(results: List[Dict], out_path: str) -> None:
+    _fields = ["candidate_id", "rank", "score", "reasoning"]
     with open(out_path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(
-            f, fieldnames=["candidate_id", "rank", "score", "reasoning"]
-        )
+        writer = csv.DictWriter(f, fieldnames=_fields)
         writer.writeheader()
-        writer.writerows(results)
+        writer.writerows({k: r[k] for k in _fields} for r in results)
+
+
+def _print_diagnostics(results: List[Dict], n: int = 20) -> None:
+    """Print a score-component breakdown table for the top-n ranked candidates."""
+    header = (
+        f"{'Rank':>4}  {'ID':<16}  {'Sem':>5}  {'Career':>6}  "
+        f"{'Behav':>5}  {'Loc':>5}  {'Avail':>5}  {'Final':>6}  Honeypot"
+    )
+    print("\n" + "─" * len(header))
+    print(header)
+    print("─" * len(header))
+    for r in results[:n]:
+        b = r.get("_breakdown", {})
+        hp = "HP" if r["reasoning"].startswith("HONEYPOT") else ""
+        print(
+            f"  #{r['rank']:>3}  {r['candidate_id']:<16}  "
+            f"{b.get('semantic',0):>5.3f}  {b.get('career',0):>6.3f}  "
+            f"{b.get('behavioral',0):>5.3f}  {b.get('location',0):>5.3f}  "
+            f"{b.get('availability',0):>5.3f}  {b.get('final',0):>6.4f}  {hp}"
+        )
+    print("─" * len(header))
 
 
 def main() -> None:
+    logging.basicConfig(level=logging.WARNING, format="%(levelname)s: %(message)s")
     ap = argparse.ArgumentParser(description="Redrob Candidate Ranker")
     ap.add_argument("--candidates", default="candidates.jsonl")
     ap.add_argument("--out", default="submission.csv")
+    ap.add_argument("--diagnostics", action="store_true",
+                    help="Print score-component breakdown table for top-20 candidates")
     args = ap.parse_args()
 
     print(f"Loading: {args.candidates}")
@@ -727,19 +1132,32 @@ def main() -> None:
 
     print("Initialising embedder …")
     embedder = Embedder()
-    print(f"  → mode: {embedder.mode}"
-          + ("" if embedder.mode == "semantic"
-             else "  (install sentence-transformers for true semantic search)"))
+    mode = embedder.mode          # "semantic" or "lexical"
+    model = embedder._model_id or "TF-IDF lexical fallback"
+    if mode == "semantic":
+        print(f"  ✓ Embedding mode : semantic")
+        print(f"  ✓ Model          : {model}")
+    else:
+        print(f"  ✗ Embedding mode : lexical (TF-IDF fallback)")
+        print(f"  ✗ Fallback reason: {embedder.load_error}")
+    weights_summary = " + ".join(
+        f"{v:.2f}×{k[:3]}" for k, v in WEIGHTS.items()
+    )
+    print(f"  ✓ Score formula  : {weights_summary}")
 
     print("Ranking …")
     results = rank_candidates(candidates, JOB_DESCRIPTION, embedder)
 
-    print(f"Writing {len(results)} rows → {args.out}")
+    hp_count = sum(1 for r in results if r["reasoning"].startswith("HONEYPOT"))
+    print(f"Writing {len(results)} rows → {args.out}  ({hp_count} honeypot(s) flagged, score=0.0)")
     write_csv(results, args.out)
 
-    print("\nTop 10:")
-    for r in results[:10]:
-        print(f"  #{r['rank']:>3}  {r['candidate_id']}  {r['score']:.4f}  {r['reasoning']}")
+    if args.diagnostics:
+        _print_diagnostics(results, n=min(20, len(results)))
+    else:
+        print("\nTop 10:")
+        for r in results[:10]:
+            print(f"  #{r['rank']:>3}  {r['candidate_id']}  {r['score']:.4f}  {r['reasoning']}")
 
 
 if __name__ == "__main__":
