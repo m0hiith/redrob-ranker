@@ -810,7 +810,117 @@ def score_availability(c: Dict) -> float:
 
 # ─── Stage 7: Honeypot Detection ──────────────────────────────────────────────
 
-def detect_honeypot(c: Dict) -> Tuple[bool, List[str]]:
+def _parse_date(raw: object) -> Optional[date]:
+    """Tolerant ISO date parse: 'YYYY-MM-DD' or 'YYYY-MM'; anything else → None."""
+    if not raw or not isinstance(raw, str):
+        return None
+    text = raw.strip()
+    for candidate in (text, f"{text}-01"):
+        try:
+            return date.fromisoformat(candidate)
+        except ValueError:
+            continue
+    return None
+
+
+# Tolerances for the date-consistency checks. Honeypot flags are a hard gate
+# (>10% in top 100 = DQ), so precision matters more than recall: generous
+# grace windows keep legitimate-but-sloppy profiles out of the net.
+_DURATION_MISMATCH_GRACE_MONTHS = 6.0
+_FUTURE_DATE_GRACE_DAYS = 60
+_ENDED_CURRENT_ROLE_GRACE_DAYS = 90
+_OVERLAP_SOFT_LIMIT_MONTHS = 24.0
+_DAYS_PER_MONTH = 30.44
+
+
+def _date_consistency_flags(
+    c: Dict, reference_date: date,
+) -> Tuple[int, int, List[str]]:
+    """
+    The spec's example honeypots are date-impossible profiles. Checks the
+    internal consistency of career_history and platform dates.
+    Returns (hard_count, soft_count, reasons).
+    """
+    history = c.get("career_history", []) or []
+    signals = c.get("redrob_signals", {}) or {}
+    hard = 0
+    soft = 0
+    reasons: List[str] = []
+
+    intervals: List[Tuple[date, date]] = []
+    for job in history:
+        if not isinstance(job, dict):
+            continue
+        start = _parse_date(job.get("start_date"))
+        end = _parse_date(job.get("end_date"))
+        is_current = bool(job.get("is_current"))
+        dur = job.get("duration_months")
+
+        if start and end and start > end:
+            hard += 1
+            reasons.append(f"role ends ({end}) before it starts ({start})")
+
+        future_cutoff = reference_date.toordinal() + _FUTURE_DATE_GRACE_DAYS
+        for d, label in ((start, "starts"), (end, "ends")):
+            if d and d.toordinal() > future_cutoff:
+                hard += 1
+                reasons.append(f"role {label} in the future ({d})")
+                break
+
+        if (
+            is_current and end
+            and (reference_date - end).days > _ENDED_CURRENT_ROLE_GRACE_DAYS
+        ):
+            hard += 1
+            reasons.append(f"marked current but ended {end}")
+
+        span_end = end or (reference_date if is_current else None)
+        if (
+            start and span_end and span_end >= start
+            and isinstance(dur, (int, float)) and dur > 0
+        ):
+            span_months = (span_end - start).days / _DAYS_PER_MONTH
+            # Two-sided check only when both dates are explicit. For open
+            # current roles the span runs to the reference date, so a smaller
+            # duration_months is just data lag — only the impossible direction
+            # (claimed tenure exceeding the available time) is fabrication.
+            mismatch = (
+                abs(dur - span_months) if end else (dur - span_months)
+            )
+            if mismatch > _DURATION_MISMATCH_GRACE_MONTHS:
+                hard += 1
+                reasons.append(
+                    f"duration_months={dur:.0f} contradicts dates "
+                    f"({start}–{span_end} ≈ {span_months:.0f}mo)"
+                )
+
+        if start and span_end and span_end > start:
+            intervals.append((start, span_end))
+
+    # Soft: heavy overlap between supposedly full-time roles.
+    overlap_days = 0
+    intervals.sort()
+    for (s1, e1), (s2, e2) in zip(intervals, intervals[1:]):
+        overlap_days += max(0, (min(e1, e2) - s2).days)
+    if overlap_days / _DAYS_PER_MONTH > _OVERLAP_SOFT_LIMIT_MONTHS:
+        soft += 1
+        reasons.append(
+            f"roles overlap by {overlap_days / _DAYS_PER_MONTH:.0f} months"
+        )
+
+    # Soft: platform activity precedes the account itself.
+    signup = _parse_date(signals.get("signup_date"))
+    last_active = _parse_date(signals.get("last_active_date"))
+    if signup and last_active and last_active < signup:
+        soft += 1
+        reasons.append(f"last active ({last_active}) before signup ({signup})")
+
+    return hard, soft, reasons
+
+
+def detect_honeypot(
+    c: Dict, reference_date: date = DEFAULT_REFERENCE_DATE,
+) -> Tuple[bool, List[str]]:
     """
     Catches organizer-inserted fakes: impossible timelines, fabricated tenure,
     expert claims with no usage. Hard flags force rejection; soft flags accumulate.
@@ -821,9 +931,7 @@ def detect_honeypot(c: Dict) -> Tuple[bool, List[str]]:
     skills = c.get("skills", [])
     history = c.get("career_history", []) or []
 
-    hard = 0
-    soft = 0
-    reasons: List[str] = []
+    hard, soft, reasons = _date_consistency_flags(c, reference_date)
 
     # Hard: used a skill longer than the entire career (+2yr grace).
     max_skill_years = max(
@@ -955,7 +1063,7 @@ def rank_candidates(
         behavioral = score_behavioral(c, reference_date)
         location = score_location(c, jd)
         availability = score_availability(c)
-        is_honeypot, hp_reasons = detect_honeypot(c)
+        is_honeypot, hp_reasons = detect_honeypot(c, reference_date)
 
         final = (
             semantic     * WEIGHTS["semantic"] +

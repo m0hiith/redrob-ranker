@@ -247,6 +247,98 @@ def test_legitimate_candidate_with_many_expert_skills_not_flagged():
     assert is_hp is False
 
 
+# ─── P8: date-consistency honeypot checks ─────────────────────────────────────
+
+def _dated_job(**overrides):
+    job = {
+        "company": "Acme", "title": "ML Engineer", "industry": "Software",
+        "start_date": "2022-01-01", "end_date": "2024-01-01",
+        "duration_months": 24, "is_current": False,
+        "description": "Built ranking systems.",
+    }
+    job.update(overrides)
+    return job
+
+
+def test_honeypot_role_ends_before_it_starts():
+    cand = _strong_candidate()
+    cand["career_history"] = [_dated_job(start_date="2024-01-01", end_date="2022-01-01")]
+    is_hp, reasons = rank.detect_honeypot(cand)
+    assert is_hp is True
+    assert any("before it starts" in r for r in reasons)
+
+
+def test_honeypot_future_dated_role():
+    cand = _strong_candidate()
+    cand["career_history"] = [_dated_job(start_date="2031-01-01", end_date=None,
+                                         is_current=True, duration_months=1)]
+    is_hp, reasons = rank.detect_honeypot(cand)
+    assert is_hp is True
+    assert any("future" in r for r in reasons)
+
+
+def test_honeypot_duration_contradicts_dates():
+    # 2 calendar years of dates but claims 8 years of tenure in the role.
+    cand = _strong_candidate()
+    cand["career_history"] = [_dated_job(duration_months=96)]
+    is_hp, reasons = rank.detect_honeypot(cand)
+    assert is_hp is True
+    assert any("contradicts dates" in r for r in reasons)
+
+
+def test_honeypot_current_role_with_past_end_date():
+    cand = _strong_candidate()
+    cand["career_history"] = [_dated_job(is_current=True, end_date="2024-01-01")]
+    is_hp, reasons = rank.detect_honeypot(cand)
+    assert is_hp is True
+    assert any("marked current" in r for r in reasons)
+
+
+def test_stale_duration_on_current_role_is_not_flagged():
+    """Open role with duration smaller than the span = data lag, not fabrication."""
+    cand = _strong_candidate()
+    cand["career_history"] = [_dated_job(start_date="2020-01-01", end_date=None,
+                                         is_current=True, duration_months=36)]
+    is_hp, reasons = rank.detect_honeypot(cand)
+    assert is_hp is False, reasons
+
+
+def test_overlapping_roles_soft_flag_only():
+    """Two heavily overlapping roles → soft flag, not an instant honeypot."""
+    from datetime import date
+    cand = _strong_candidate()
+    cand["profile"]["years_of_experience"] = 8.0
+    cand["career_history"] = [
+        _dated_job(start_date="2018-01-01", end_date="2022-01-01", duration_months=48),
+        _dated_job(company="Other", start_date="2018-06-01", end_date="2022-06-01",
+                   duration_months=48),
+    ]
+    hard, soft, reasons = rank._date_consistency_flags(cand, date(2026, 6, 1))
+    assert hard == 0
+    assert soft >= 1
+    assert any("overlap" in r for r in reasons)
+    is_hp, _ = rank.detect_honeypot(cand)
+    assert is_hp is False  # one soft flag alone must not condemn
+
+
+def test_last_active_before_signup_soft_flag():
+    from datetime import date
+    cand = _strong_candidate()
+    cand["redrob_signals"]["signup_date"] = "2025-06-01"
+    cand["redrob_signals"]["last_active_date"] = "2024-01-01"
+    hard, soft, reasons = rank._date_consistency_flags(cand, date(2026, 6, 1))
+    assert hard == 0
+    assert soft >= 1
+    assert any("signup" in r for r in reasons)
+
+
+def test_undated_history_triggers_no_date_flags():
+    """The strong fixture has no start/end dates — date checks must all skip."""
+    from datetime import date
+    hard, soft, reasons = rank._date_consistency_flags(_strong_candidate(), date(2026, 6, 1))
+    assert (hard, soft, reasons) == (0, 0, [])
+
+
 # ─── Stage 4: Career negative signals ─────────────────────────────────────────
 
 def test_consulting_only_penalised():
