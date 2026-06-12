@@ -338,6 +338,62 @@ def test_depth_bonus_threshold_boundary():
     assert rank._search_depth_bonus(at) == pytest.approx(0.08)
 
 
+# ─── P4: word-boundary surface matching (no substring false positives) ───────
+
+def test_research_title_gets_no_search_credit():
+    """'Market Research Analyst' must not match the 'search' title surface."""
+    assert rank._RELEVANT_TITLE_PATTERN.search("market research analyst") is None
+    assert rank._RELEVANT_TITLE_PATTERN.search("search engineer") is not None
+    assert rank._RELEVANT_TITLE_PATTERN.search("research engineer") is not None  # explicit surface
+
+
+@pytest.mark.parametrize("text,concept", [
+    ("delivered the product roadmap on time", "Evaluation Metrics (NDCG, MRR, MAP)"),
+    ("sprint planning and backlog grooming", "Vector Databases"),       # "ann"
+    ("managed cloud storage infrastructure", "Retrieval Systems"),      # "rag"
+    ("collaborated across teams", "Open Source"),                       # "oss"
+    ("standardised report formats", "HR Tech"),                         # "ats"
+])
+def test_no_substring_false_positive(text, concept):
+    assert rank.CONCEPT_PATTERNS[concept].search(text) is None, (
+        f"{concept!r} pattern must not fire on {text!r}"
+    )
+
+
+@pytest.mark.parametrize("text,concept", [
+    ("built semantic search with embeddings", "Retrieval Systems"),
+    ("evaluated with ndcg, mrr and map", "Evaluation Metrics (NDCG, MRR, MAP)"),
+    ("indexed vectors in faiss and qdrant", "Vector Databases"),
+    ("hnsw ann index tuning", "Vector Databases"),
+    ("re-ranking with a cross-encoder", "Ranking/Search Systems"),
+])
+def test_real_surfaces_still_match(text, concept):
+    assert rank.CONCEPT_PATTERNS[concept].search(text) is not None, (
+        f"{concept!r} pattern should fire on {text!r}"
+    )
+
+
+def test_research_analyst_career_scores_below_search_engineer():
+    """End-to-end: the substring bug used to give research analysts title credit."""
+    analyst = _strong_candidate()
+    analyst["candidate_id"] = "C_ANALYST"
+    analyst["profile"]["current_title"] = "Market Research Analyst"
+    analyst["career_history"] = [{
+        "company": "Acme Corp", "title": "Market Research Analyst",
+        "duration_months": 36, "is_current": True, "industry": "Consumer Goods",
+        "description": "Conducted market research surveys and consumer analysis.",
+    }]
+    analyst["skills"] = []
+
+    engineer = _strong_candidate()
+
+    cov_a = rank.concept_coverage(analyst, rank.JOB_DESCRIPTION)
+    cov_e = rank.concept_coverage(engineer, rank.JOB_DESCRIPTION)
+    score_a, _ = rank.score_career(analyst, cov_a)
+    score_e, _ = rank.score_career(engineer, cov_e)
+    assert score_e > score_a + 0.2
+
+
 # ─── Embedder: strict offline loading + opt-in fallback ──────────────────────
 
 def test_embedder_raises_when_model_missing_and_no_fallback(tmp_path):

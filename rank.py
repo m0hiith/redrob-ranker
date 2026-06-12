@@ -210,6 +210,42 @@ _SEARCH_PILLARS = (
     "Production ML",
 )
 
+# Job titles that count as directly relevant to the role (beyond the
+# Ranking/Search concept surfaces, which are also accepted as title words).
+RELEVANT_TITLE_SURFACES = CONCEPTS["Ranking/Search Systems"] | {
+    "ml engineer", "machine learning engineer", "ai engineer",
+    "applied ml", "nlp engineer", "research engineer", "data scientist",
+    "mlops engineer", "search engineer", "recommendation systems engineer",
+    "relevance engineer", "ranking engineer", "retrieval engineer",
+    "applied scientist", "search platform engineer", "vector search engineer",
+}
+
+
+def _surface_pattern(surfaces) -> "re.Pattern":
+    """
+    Compile a word-boundary alternation for a set of surface forms.
+
+    Plain `surface in text` substring tests false-positive at scale:
+    "search" hits "research", "map" hits "roadmap", "ann" hits "planning",
+    "rag" hits "storage". Custom lookaround boundaries (not \\b) are used so
+    surfaces containing non-word chars ("a/b test", "c++") still anchor on
+    their alphanumeric edges. Longest-first ordering makes multi-word
+    surfaces win over their own substrings.
+    """
+    alts = sorted((re.escape(s) for s in surfaces), key=len, reverse=True)
+    return re.compile(r"(?<![a-z0-9])(?:" + "|".join(alts) + r")(?![a-z0-9])")
+
+
+# Compiled once at module load — reused across all 100K candidates.
+CONCEPT_PATTERNS: Dict[str, "re.Pattern"] = {
+    name: _surface_pattern(surfaces) for name, surfaces in CONCEPTS.items()
+}
+_RELEVANT_TITLE_PATTERN = _surface_pattern(RELEVANT_TITLE_SURFACES)
+_SERVICES_COMPANY_PATTERN = _surface_pattern(SERVICES_COMPANIES)
+_PRODUCT_DESC_PATTERN = _surface_pattern(_PRODUCT_DESC_SIGNALS)
+_RESEARCH_TITLE_PATTERN = _surface_pattern({"research", "researcher"})
+_LANGCHAIN_PATTERN = _surface_pattern({"langchain"})
+
 PROFICIENCY = {"beginner": 0.25, "intermediate": 0.50, "advanced": 0.80, "expert": 1.00}
 _VALID_PROFICIENCIES = frozenset(PROFICIENCY)
 
@@ -481,8 +517,8 @@ def concept_coverage(c: Dict, jd: Dict) -> Dict[str, float]:
                 # Endorsed skill on a core concept → extra credibility boost.
                 if skill_endorsements.get(surface, 0) >= 5:
                     hit = min(hit + 0.10, 1.0)
-            elif surface in blob:
-                hit = max(hit, 0.6)          # mentioned in text = moderate
+        if hit < 0.6 and CONCEPT_PATTERNS[req].search(blob):
+            hit = max(hit, 0.6)              # mentioned in text = moderate
         coverage[req] = hit
     return coverage
 
@@ -497,11 +533,11 @@ def _product_company_signal(c: Dict) -> float:
         ind = (job.get("industry", "") or "").lower()
         comp = (job.get("company", "") or "").lower()
         desc = (job.get("description", "") or "").lower()
-        if ind in PRODUCT_INDUSTRIES and not any(s in comp for s in SERVICES_COMPANIES):
+        if ind in PRODUCT_INDUSTRIES and not _SERVICES_COMPANY_PATTERN.search(comp):
             best = max(best, 1.0)
         elif ind in PRODUCT_INDUSTRIES:
             best = max(best, 0.6)
-        elif any(sig in desc for sig in _PRODUCT_DESC_SIGNALS):
+        elif _PRODUCT_DESC_PATTERN.search(desc):
             # Services/consulting firm but description shows product-ML work style
             # (e.g., shipped ranking system for a client's product). Partial credit.
             best = max(best, 0.4)
@@ -547,14 +583,6 @@ def score_career(c: Dict, coverage: Dict[str, float]) -> Tuple[float, List[str]]
     if not history:
         return 0.15, flags
 
-    relevant_titles = CONCEPTS["Ranking/Search Systems"] | {
-        "ml engineer", "machine learning engineer", "ai engineer",
-        "applied ml", "nlp engineer", "research engineer", "data scientist",
-        "mlops engineer", "search engineer", "recommendation systems engineer",
-        "relevance engineer", "ranking engineer", "retrieval engineer",
-        "applied scientist", "search platform engineer", "vector search engineer",
-    }
-
     weighted_sum = 0.0
     weight_total = 0.0
     for i, job in enumerate(history):
@@ -564,17 +592,16 @@ def score_career(c: Dict, coverage: Dict[str, float]) -> Tuple[float, List[str]]
         industry = (job.get("industry", "") or "").lower()
         company = (job.get("company", "") or "").lower()
 
-        title_s = 0.85 if any(t in title for t in relevant_titles) else 0.25
+        title_s = 0.85 if _RELEVANT_TITLE_PATTERN.search(title) else 0.25
         concept_hits = sum(
-            1 for surfaces in
-            (CONCEPTS["Retrieval Systems"], CONCEPTS["Vector Databases"],
-             CONCEPTS["Ranking/Search Systems"], CONCEPTS["Embeddings"],
-             CONCEPTS["Production ML"])
-            if any(s in desc for s in surfaces)
+            1 for name in
+            ("Retrieval Systems", "Vector Databases",
+             "Ranking/Search Systems", "Embeddings", "Production ML")
+            if CONCEPT_PATTERNS[name].search(desc)
         )
         desc_s = _clamp(concept_hits / 3.0)
         prod_s = 1.0 if (industry in PRODUCT_INDUSTRIES and
-                         not any(s in company for s in SERVICES_COMPANIES)) else 0.35
+                         not _SERVICES_COMPANY_PATTERN.search(company)) else 0.35
 
         job_score = title_s * 0.40 + desc_s * 0.35 + prod_s * 0.25
 
@@ -617,7 +644,7 @@ def _apply_negative_signals(
     def is_services(job: Dict) -> bool:
         ind = (job.get("industry", "") or "").lower()
         comp = (job.get("company", "") or "").lower()
-        return ind in SERVICES_INDUSTRIES or any(s in comp for s in SERVICES_COMPANIES)
+        return ind in SERVICES_INDUSTRIES or bool(_SERVICES_COMPANY_PATTERN.search(comp))
 
     if history and all(is_services(j) for j in history):
         score *= 0.55
@@ -625,7 +652,7 @@ def _apply_negative_signals(
 
     # Pure research: research titles with no production/MLOps footprint.
     titles = " ".join((j.get("title", "") or "").lower() for j in history)
-    if "research" in titles and coverage.get("Production ML", 0) < 0.6:
+    if _RESEARCH_TITLE_PATTERN.search(titles) and coverage.get("Production ML", 0) < 0.6:
         score *= 0.70
         flags.append("pure-research")
 
@@ -641,15 +668,17 @@ def _apply_negative_signals(
         flags.append("cv-only")
 
     # LangChain-only: rides LangChain/RAG buzzwords without real retrieval depth.
-    has_langchain = "langchain" in skill_names or "langchain" in candidate_text_blob(c)
+    has_langchain = (
+        "langchain" in skill_names
+        or bool(_LANGCHAIN_PATTERN.search(candidate_text_blob(c)))
+    )
     if has_langchain and coverage.get("Vector Databases", 0) < 0.6 and core_hits < 0.6:
         score *= 0.65
         flags.append("langchain-only")
 
     # No production deployments anywhere.
     if coverage.get("Production ML", 0) < 0.6 and not any(
-        any(s in (j.get("description", "") or "").lower()
-            for s in CONCEPTS["Production ML"])
+        CONCEPT_PATTERNS["Production ML"].search((j.get("description", "") or "").lower())
         for j in history
     ):
         score *= 0.80
