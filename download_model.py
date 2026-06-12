@@ -19,16 +19,12 @@ MODEL_ID = "BAAI/bge-small-en-v1.5"
 DEFAULT_OUT = Path(__file__).parent / "models" / "bge-small-en-v1.5"
 
 
-def main() -> None:
-    ap = argparse.ArgumentParser(description="Download the ranking embedding model")
-    ap.add_argument("--out", default=str(DEFAULT_OUT),
-                    help=f"Target directory (default: {DEFAULT_OUT})")
-    args = ap.parse_args()
-
-    out = Path(args.out)
+def ensure_model(out: Path = DEFAULT_OUT) -> Path:
+    """Vendor the model into `out` if not already present. Returns the path."""
+    out = Path(out)
     if (out / "config.json").exists():
         print(f"Model already present at {out} — nothing to do.")
-        return
+        return out
 
     print(f"Downloading {MODEL_ID} → {out}")
     try:
@@ -40,6 +36,15 @@ def main() -> None:
     out.mkdir(parents=True, exist_ok=True)
     model.save(str(out))
     print(f"Saved. Ranking can now run fully offline: python rank.py --model-dir {out}")
+    return out
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description="Download the ranking embedding model")
+    ap.add_argument("--out", default=str(DEFAULT_OUT),
+                    help=f"Target directory (default: {DEFAULT_OUT})")
+    args = ap.parse_args()
+    ensure_model(Path(args.out))
 
 
 if __name__ == "__main__":

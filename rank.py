@@ -1507,28 +1507,40 @@ def validate_candidate(c: object) -> Tuple[bool, List[str]]:
     return not fatal, issues
 
 
+def _parse_jsonl(f) -> List:
+    raw: List = []
+    for ln_no, ln in enumerate(f, 1):
+        if not ln.strip():
+            continue
+        try:
+            raw.append(json.loads(ln))
+        except json.JSONDecodeError as exc:
+            logger.error("Line %d: JSON parse error — %s", ln_no, exc)
+    return raw
+
+
 def load_candidates(path: str) -> List[Dict]:
     p = Path(path)
     # Supports .json (array), .jsonl, and gzip-compressed variants (.jsonl.gz / .json.gz).
+    # The extension is a hint only — the official bundle ships JSONL content in a
+    # file named candidates.json, so a whole-file parse failure falls back to JSONL.
     is_gz = p.suffix.lower() == ".gz"
     fmt = (p.suffixes[-2].lower() if is_gz and len(p.suffixes) >= 2 else p.suffix.lower())
     opener = (lambda: gzip.open(p, "rt", encoding="utf-8")) if is_gz \
         else (lambda: open(p, "r", encoding="utf-8"))
 
     if fmt == ".jsonl":
-        raw: List = []
         with opener() as f:
-            for ln_no, ln in enumerate(f, 1):
-                if not ln.strip():
-                    continue
-                try:
-                    raw.append(json.loads(ln))
-                except json.JSONDecodeError as exc:
-                    logger.error("Line %d: JSON parse error — %s", ln_no, exc)
+            raw = _parse_jsonl(f)
     else:
-        with opener() as f:
-            data = json.load(f)
-        raw = data if isinstance(data, list) else [data]
+        try:
+            with opener() as f:
+                data = json.load(f)
+            raw = data if isinstance(data, list) else [data]
+        except json.JSONDecodeError:
+            logger.warning("%s is not a single JSON document — parsing as JSONL", p.name)
+            with opener() as f:
+                raw = _parse_jsonl(f)
 
     valid: List[Dict] = []
     rejected = 0

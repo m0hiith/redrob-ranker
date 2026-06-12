@@ -1039,6 +1039,17 @@ def test_load_candidates_malformed_jsonl_line_skipped(tmp_path):
     assert result[0]["candidate_id"] == "C_STRONG"
 
 
+def test_load_candidates_jsonl_content_in_json_file(tmp_path):
+    """The official bundle ships JSONL content named candidates.json."""
+    a = _strong_candidate()
+    b = _strong_candidate()
+    b["candidate_id"] = "C_SECOND"
+    p = tmp_path / "candidates.json"   # .json extension, JSONL content
+    _write_jsonl([a, b], p)
+    result = rank.load_candidates(str(p))
+    assert [c["candidate_id"] for c in result] == ["C_STRONG", "C_SECOND"]
+
+
 def test_load_candidates_warning_record_still_scored(tmp_path):
     # Missing redrob_signals is a warning, not a rejection — record should be scored.
     c = _strong_candidate()

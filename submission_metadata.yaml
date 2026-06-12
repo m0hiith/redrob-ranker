@@ -1,0 +1,87 @@
+# Redrob Hackathon — Submission Metadata
+# Mirrors the portal submission; verified at Stage 3.
+
+# ============================================================================
+# Team identity
+# ============================================================================
+team_name: "TODO-registered-team-name"
+
+primary_contact:
+  name: "Mohith"                  # TODO: full name as registered
+  email: "mohith4558p4@gmail.com"
+  phone: "+91-TODO"
+
+team_members:
+  - name: "Mohith"                # TODO: full name as registered
+    email: "mohith4558p4@gmail.com"
+    role: "ML Engineer (solo)"
+
+# ============================================================================
+# Code and reproducibility
+# ============================================================================
+github_repo: "https://github.com/TODO-username/redrob-ranker"
+sandbox_link: "https://TODO-deploy-app-py (Streamlit Cloud / HF Spaces)"
+
+reproduce_command: "python rank.py --candidates ./candidates.jsonl --out ./submission.csv"
+# Accepts .json / .jsonl / .jsonl.gz; content-sniffs the official
+# candidates.json (which contains JSONL). One-time pre-computation
+# (network, ~1 min): python download_model.py — vendors the embedding model
+# into ./models/ so the ranking step itself runs with zero network access.
+
+# ============================================================================
+# Compute environment
+# ============================================================================
+compute:
+  platform: "MacBook Air M1"
+  cpu_cores: 8
+  ram_gb: 8                          # ranking fits in 8 GB — comfortably under the 16 GB cap
+  python_version: "3.13.3"
+  os: "macOS 26.2"
+  uses_gpu_for_inference: false
+  has_network_during_ranking: false  # model loaded from local dir; HF_HUB_OFFLINE enforced
+  pre_computation_required: true     # one-time model download (download_model.py)
+  pre_computation_time_minutes: 2
+
+# ============================================================================
+# AI tools declaration
+# ============================================================================
+ai_tools_used:
+  - "Claude"
+
+ai_usage_summary: |
+  Claude Code was used as a pair programmer throughout: spec analysis,
+  architecture discussion, implementation, code review, and test writing.
+  All design decisions (two-stage ranking, scoring weights, honeypot rules)
+  were reviewed and are defensible by the author. No candidate data was sent
+  to any hosted LLM; the ranking pipeline itself makes no LLM or API calls.
+
+# ============================================================================
+# Approach summary
+# ============================================================================
+methodology_summary: |
+  Two-stage ranking mirroring a production retrieval system. Stage A screens
+  all 100K candidates on cheap features: concept coverage over a hand-built
+  skill ontology (word-boundary matched, endorsement/duration-trusted against
+  keyword-stuffers), recruiter-style career-trajectory scoring with the JD's
+  explicit negative signals (consulting-only, pure research, CV/speech/
+  robotics-only, LangChain-only, title-chasing job-hoppers), behavioral
+  engagement, city-tier location fit, and availability. Stage B re-ranks the
+  top 2,000 with true semantic similarity (BAAI/bge-small-en-v1.5, local CPU,
+  offline) against a surface-form-expanded JD document, blended
+  0.40 semantic + 0.30 career + 0.15 behavioral + 0.10 location +
+  0.05 availability. A honeypot detector (tenure impossibilities,
+  date inconsistencies, zero-usage "expert" stacks, assessment contradictions)
+  zeroes fakes out of the top 100. Reasoning is generated per rank band from
+  actual profile fields. Fully deterministic: data-derived reference date,
+  hash-seeded phrasing, candidate_id tie-breaks. ~3 minutes end-to-end on an
+  8-core CPU laptop.
+
+# ============================================================================
+# Declarations
+# ============================================================================
+declarations:
+  read_submission_spec: true
+  code_is_original_work: true
+  no_collusion: true
+  honeypot_check_done: true          # self_check.py reports honeypot rate in top 100
+  reproduction_tested: true
