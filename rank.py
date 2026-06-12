@@ -33,6 +33,7 @@ import logging
 import math
 import os
 import re
+import time
 from collections import Counter
 from datetime import date
 from pathlib import Path
@@ -1044,25 +1045,91 @@ def build_reasoning(
 
 # ─── Main Pipeline ────────────────────────────────────────────────────────────
 
+# Stage-A → Stage-B handoff size. The CSV needs the top 100; re-ranking the
+# top 2,000 prescreened candidates (20× margin) keeps every plausible
+# top-100 contender while cutting CPU embedding work from 100K docs
+# (~30-55 min, busts the 5-min budget) to ~2K docs (well under a minute).
+PRESCREEN_FINALISTS = 2000
+
+
+def _score_components(
+    c: Dict, jd: Dict, reference_date: date,
+) -> Tuple[Dict[str, float], float, List[str], float, float, float]:
+    """Shared non-semantic scoring used by both stages — identical by construction."""
+    coverage = concept_coverage(c, jd)
+    career, career_flags = score_career(c, coverage)
+    behavioral = score_behavioral(c, reference_date)
+    location = score_location(c, jd)
+    availability = score_availability(c)
+    return coverage, career, career_flags, behavioral, location, availability
+
+
+def _coverage_proxy(coverage: Dict[str, float], jd: Dict) -> float:
+    """
+    Stage-A stand-in for the semantic score: must-haves count double.
+    Only used to pick finalists; the final blend uses true embeddings.
+    """
+    must, good = jd["must_have"], jd["good_to_have"]
+    total = 2 * sum(coverage.get(r, 0) for r in must) + sum(coverage.get(r, 0) for r in good)
+    return total / (2 * len(must) + len(good))
+
+
+def prescreen(
+    candidates: List[Dict], jd: Dict, reference_date: date,
+    finalists: int = PRESCREEN_FINALISTS,
+) -> List[Dict]:
+    """
+    Stage A: rank the full pool on cheap features only (concept coverage,
+    career, behavioral, location, availability) and return the finalists for
+    semantic re-ranking. Deterministic tie-break by candidate_id.
+    """
+    if len(candidates) <= finalists:
+        return candidates
+    ranked = []
+    for c in candidates:
+        coverage, career, _, behavioral, location, availability = (
+            _score_components(c, jd, reference_date)
+        )
+        score = (
+            _coverage_proxy(coverage, jd) * WEIGHTS["semantic"] +
+            career       * WEIGHTS["career"] +
+            behavioral   * WEIGHTS["behavioral"] +
+            location     * WEIGHTS["location"] +
+            availability * WEIGHTS["availability"]
+        )
+        ranked.append((-score, c.get("candidate_id", ""), c))
+    ranked.sort(key=lambda x: (x[0], x[1]))
+    return [c for _, _, c in ranked[:finalists]]
+
+
 def rank_candidates(
     candidates: List[Dict], jd: Dict, embedder: Embedder,
     reference_date: Optional[date] = None,
+    finalists: int = PRESCREEN_FINALISTS,
+    show_timings: bool = False,
 ) -> List[Dict]:
     if reference_date is None:
         reference_date = derive_reference_date(candidates)
+
+    # Stage A: cheap full-pool screen (no embeddings).
+    t0 = time.perf_counter()
+    pool = prescreen(candidates, jd, reference_date, finalists)
+    t_screen = time.perf_counter() - t0
+
+    # Stage B: true semantic similarity for finalists only.
+    t0 = time.perf_counter()
     jd_doc = jd_document(jd)
-    cand_docs = [candidate_document(c) for c in candidates]
+    cand_docs = [candidate_document(c) for c in pool]
     semantic_scores = embedder.similarities(jd_doc, cand_docs)
+    t_embed = time.perf_counter() - t0
 
+    t0 = time.perf_counter()
     scored = []
-    for c, semantic in zip(candidates, semantic_scores):
-        coverage = concept_coverage(c, jd)
+    for c, semantic in zip(pool, semantic_scores):
+        coverage, career, career_flags, behavioral, location, availability = (
+            _score_components(c, jd, reference_date)
+        )
         features = engineer_features(c, jd, coverage)
-
-        career, career_flags = score_career(c, coverage)
-        behavioral = score_behavioral(c, reference_date)
-        location = score_location(c, jd)
-        availability = score_availability(c)
         is_honeypot, hp_reasons = detect_honeypot(c, reference_date)
 
         final = (
@@ -1119,6 +1186,13 @@ def rank_candidates(
             "reasoning": row["reasoning"],
             "_breakdown": row.get("_breakdown", {}),
         })
+    t_blend = time.perf_counter() - t0
+
+    if show_timings:
+        print(
+            f"  ✓ Stage timings  : screen {t_screen:.1f}s ({len(candidates)} cands) | "
+            f"embed {t_embed:.1f}s ({len(pool)} finalists) | blend {t_blend:.1f}s"
+        )
     return results
 
 
@@ -1339,6 +1413,8 @@ def main() -> None:
     ap.add_argument("--reference-date", default=None,
                     help="Override the deterministic 'today' (YYYY-MM-DD). Default: "
                          "max last_active_date in the pool — same data, same output.")
+    ap.add_argument("--finalists", type=int, default=PRESCREEN_FINALISTS,
+                    help="Stage-A prescreen size handed to semantic re-ranking")
     ap.add_argument("--diagnostics", action="store_true",
                     help="Print score-component breakdown table for top-20 candidates")
     args = ap.parse_args()
@@ -1372,7 +1448,10 @@ def main() -> None:
     print(f"  ✓ Score formula  : {weights_summary}")
 
     print("Ranking …")
-    results = rank_candidates(candidates, JOB_DESCRIPTION, embedder, reference_date)
+    results = rank_candidates(
+        candidates, JOB_DESCRIPTION, embedder, reference_date,
+        finalists=args.finalists, show_timings=True,
+    )
 
     hp_count = sum(1 for r in results if r["reasoning"].startswith("HONEYPOT"))
     print(f"Writing {len(results)} rows → {args.out}  ({hp_count} honeypot(s) flagged, score=0.0)")

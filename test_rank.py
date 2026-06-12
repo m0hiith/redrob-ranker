@@ -430,6 +430,60 @@ def test_depth_bonus_threshold_boundary():
     assert rank._search_depth_bonus(at) == pytest.approx(0.08)
 
 
+# ─── P3: two-stage ranking (prescreen → semantic re-rank) ────────────────────
+
+def _junk_candidate(i: int):
+    return {
+        "candidate_id": f"C_JUNK_{i:04d}",
+        "profile": {"current_title": "Accountant", "years_of_experience": 4.0,
+                    "country": "India", "summary": "Bookkeeping and audits.",
+                    "headline": "Accountant"},
+        "career_history": [{"company": "Ledger LLP", "title": "Accountant",
+                            "duration_months": 48, "is_current": True,
+                            "industry": "Accounting",
+                            "description": "Managed accounts and tax filings."}],
+        "education": [], "skills": [{"name": "Excel", "proficiency": "advanced",
+                                     "duration_months": 48, "endorsements": 3}],
+        "redrob_signals": _signals(),
+    }
+
+
+def test_prescreen_keeps_strong_candidate():
+    from datetime import date
+    pool = [_junk_candidate(i) for i in range(50)] + [_strong_candidate()]
+    finalists = rank.prescreen(pool, rank.JOB_DESCRIPTION, date(2026, 6, 1), finalists=5)
+    assert len(finalists) == 5
+    assert any(c["candidate_id"] == "C_STRONG" for c in finalists)
+
+
+def test_prescreen_passthrough_when_pool_small():
+    from datetime import date
+    pool = [_strong_candidate()]
+    assert rank.prescreen(pool, rank.JOB_DESCRIPTION, date(2026, 6, 1), finalists=2000) == pool
+
+
+def test_prescreen_is_deterministic():
+    from datetime import date
+    pool = [_junk_candidate(i) for i in range(30)]
+    a = rank.prescreen(pool, rank.JOB_DESCRIPTION, date(2026, 6, 1), finalists=10)
+    b = rank.prescreen(list(reversed(pool)), rank.JOB_DESCRIPTION, date(2026, 6, 1), finalists=10)
+    assert [c["candidate_id"] for c in a] == [c["candidate_id"] for c in b]
+
+
+def test_two_stage_pipeline_ranks_strong_first():
+    pool = [_junk_candidate(i) for i in range(40)] + [_strong_candidate()]
+    results = rank.rank_candidates(
+        pool, rank.JOB_DESCRIPTION, _lexical_embedder(), finalists=10,
+    )
+    assert results[0]["candidate_id"] == "C_STRONG"
+    # Only finalists are scored/output (10 < 100 cap here).
+    assert len(results) == 10
+    ranks = [r["rank"] for r in results]
+    assert ranks == list(range(1, 11))
+    scores = [r["score"] for r in results]
+    assert scores == sorted(scores, reverse=True)
+
+
 # ─── P5: deterministic reference date ─────────────────────────────────────────
 
 def test_reference_date_derived_from_pool_max_last_active():
