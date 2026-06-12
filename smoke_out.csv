@@ -1,4 +1,4 @@
 candidate_id,rank,score,reasoning
-CAND_0000031,1,0.8456,"Recommendation Systems Engineer at Swiggy with 6.0y exp; covers Embeddings, Retrieval Systems, Vector Databases; highly responsive (91%); strong search depth (3/4 pillars); Hyderabad, Telangana-based."
-CAND_0000001,2,0.4828,"Backend Engineer at Mindtree with 6.9y exp; covers Embeddings, Vector Databases, Python; low response rate (34%); concern: consulting-only background; Toronto-based."
-CAND_0000002,3,0.4434,"Operations Manager at Wipro with 12.5y exp; covers no core skill matches; low response rate (29%); concern: consulting-only background; no production deployment signals; Chennai, Tamil Nadu-based."
+CAND_0000031,1,0.8371,"6y Recommendation Systems Engineer at Swiggy — brings Embeddings, Retrieval Systems, Vector Databases, matching the JD's production embeddings-based retrieval must-have with 3/4 search-engineering pillars covered; answers 91% of recruiter messages, active on the platform this month. Watch-item: a 60-day notice period."
+CAND_0000001,2,0.4755,"Standout profile: Backend Engineer at Mindtree, 6.9y — shows Embeddings, Vector Databases, Python in actual roles, which lines up with the JD's production embeddings-based retrieval must-have; only a 34% recruiter response rate and recently active. Watch-item: an entirely consulting/services career."
+CAND_0000002,3,0.4289,12.5y Operations Manager at Wipro — offers no evidence against the JD's retrieval/ranking must-haves; only a 29% recruiter response rate. Watch-item: an entirely consulting/services career.
