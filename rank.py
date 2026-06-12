@@ -42,8 +42,9 @@ from typing import Dict, List, Optional, Tuple
 # ─── Stage 1: Job Description (weighted requirements) ─────────────────────────
 # Extracted directly from the JD. Edit this block to target a different role.
 JOB_DESCRIPTION: Dict = {
-    "title": "Search / Ranking Machine Learning Engineer",
+    "title": "Senior AI Engineer — Founding Team (search, ranking, retrieval)",
     "responsibilities": [
+        "Own the intelligence layer: ranking, retrieval and matching systems",
         "Build and improve large-scale retrieval and ranking systems",
         "Design embedding pipelines and serve them from a vector database",
         "Own offline evaluation with NDCG, MRR and MAP and ship to production",
@@ -72,14 +73,15 @@ JOB_DESCRIPTION: Dict = {
     "negative_signals": [
         "Pure Research",
         "Consulting-only career",
-        "Computer Vision only",
+        "CV/speech/robotics without NLP/IR",
         "LangChain-only experience",
         "No production deployments",
+        "Title-chasing job-hop pattern",
     ],
-    "experience_years_min": 2,
-    "experience_years_ideal": 6,
-    # Where the role lives. Used by the location score.
-    "location": {"country": "India", "remote_ok": True},
+    # Where the role lives. The JD is hybrid in Pune/Noida with relocation
+    # welcome from Tier-1 Indian cities — NOT a remote role.
+    # YoE fit (JD: 5-9 years, ideal 6-8) is encoded in _yoe_score below.
+    "location": {"country": "India", "cities": ["Pune", "Noida"], "work_mode": "hybrid"},
 }
 
 # ─── Stage 6: Final score weights (sum to 1.0) ───────────────────────────────
@@ -222,11 +224,43 @@ _PRODUCT_DESC_SIGNALS = {
     "production ml system", "production serving",
 }
 
-# Skill surfaces that are purely Computer Vision (the "CV only" negative signal).
+# Out-of-domain specialist skill groups (JD: "primary expertise in CV /
+# speech / robotics without significant NLP/IR exposure" is a reject).
 CV_SKILLS = {
     "opencv", "yolo", "cnn", "object detection", "image classification",
     "image segmentation", "gans", "computer vision",
 }
+SPEECH_SKILLS = {
+    "asr", "tts", "speech recognition", "speech synthesis", "wav2vec",
+    "kaldi", "whisper", "speaker diarization", "audio processing",
+}
+ROBOTICS_SKILLS = {
+    "slam", "ros", "robot operating system", "robotics", "motion planning",
+    "path planning", "lidar", "control systems", "autonomous navigation",
+}
+OOD_SKILL_GROUPS = {
+    "cv-only": CV_SKILLS,
+    "speech-only": SPEECH_SKILLS,
+    "robotics-only": ROBOTICS_SKILLS,
+}
+
+# Title-seniority ladder for the title-chaser (job-hopper) signal.
+_SENIORITY_RANKS = (
+    ("intern", 0), ("trainee", 0),
+    ("junior", 1), ("associate", 1),
+    ("principal", 5), ("staff", 4), ("lead", 4),
+    ("senior", 3),  # checked after staff/principal so "senior staff" ranks 4+
+    ("director", 6), ("head", 6), ("vp", 7), ("vice president", 7), ("chief", 7),
+)
+_DEFAULT_SENIORITY = 2  # plain IC title
+
+
+def _title_seniority(title: str) -> int:
+    best = None
+    for marker, level in _SENIORITY_RANKS:
+        if re.search(rf"(?<![a-z0-9]){marker}(?![a-z0-9])", title):
+            best = level if best is None else max(best, level)
+    return _DEFAULT_SENIORITY if best is None else best
 
 # The four pillars that define a full-stack search engineer.
 # Covering all four separates specialists from tool-mentioners.
@@ -696,16 +730,40 @@ def _apply_negative_signals(
         score *= 0.70
         flags.append("pure-research")
 
-    # Computer-vision only: CV-heavy skills, no retrieval/ranking depth.
-    cv_hits = len(skill_names & CV_SKILLS)
+    # Out-of-domain specialist: CV/speech/robotics-heavy skills with no
+    # retrieval/ranking depth (JD explicit reject). One penalty is enough.
     core_hits = (
         coverage.get("Retrieval Systems", 0)
         + coverage.get("Vector Databases", 0)
         + coverage.get("Ranking/Search Systems", 0)
     )
-    if cv_hits >= 2 and core_hits < 0.6:
-        score *= 0.60
-        flags.append("cv-only")
+    for ood_flag, group in OOD_SKILL_GROUPS.items():
+        if len(skill_names & group) >= 2 and core_hits < 0.6:
+            score *= 0.60
+            flags.append(ood_flag)
+            break
+
+    # Title-chaser: job-hops every ~1.5y up the seniority ladder (JD explicit
+    # DO-NOT-WANT: "want 3+ year commitment"). Three+ consecutive completed
+    # stints under 20 months, climbing titles toward the present.
+    non_current = [j for j in history if not j.get("is_current")]
+    streak = []
+    for job in non_current:
+        dur = job.get("duration_months", 0) or 0
+        if 0 < dur < 20:
+            streak.append(job)
+        else:
+            break
+    if len(streak) >= 3:
+        # history is most-recent-first; reverse to chronological order.
+        levels = [
+            _title_seniority((j.get("title") or "").lower())
+            for j in reversed(streak)
+        ]
+        non_decreasing = all(b >= a for a, b in zip(levels, levels[1:]))
+        if non_decreasing and levels[-1] > levels[0]:
+            score *= 0.75
+            flags.append("title-chaser")
 
     # LangChain-only: rides LangChain/RAG buzzwords without real retrieval depth.
     has_langchain = (
@@ -780,23 +838,54 @@ def score_behavioral(c: Dict, reference_date: date = DEFAULT_REFERENCE_DATE) -> 
 
 # ─── Location & Availability ──────────────────────────────────────────────────
 
+# JD: "Hyderabad, Mumbai, Delhi NCR welcome" + relocation from Tier-1 cities.
+_WELCOME_CITIES = {
+    "hyderabad", "mumbai", "navi mumbai", "delhi", "new delhi", "delhi ncr",
+    "gurgaon", "gurugram", "ghaziabad", "faridabad", "bengaluru", "bangalore",
+}
+
+
 def score_location(c: Dict, jd: Dict) -> float:
+    """
+    City-tier fit for a hybrid Pune/Noida role.
+
+        JD cities (Pune/Noida)           1.00
+        welcome metros (Hyd/Mum/NCR/Blr) 0.85
+        elsewhere in India               0.65
+        abroad, willing to relocate      0.45
+        abroad                           0.20
+
+    Work-mode preference adjusts ±20%: the JD is hybrid, so a hard "remote"
+    preference is a real mismatch while hybrid/flexible/onsite all fit.
+    """
     p = c.get("profile", {})
     s = c.get("redrob_signals", {})
     target = jd.get("location", {})
 
-    score = 0.40  # baseline
-    if (p.get("country", "") or "").lower() == (target.get("country", "") or "").lower():
-        score += 0.35
+    country = (p.get("country", "") or "").lower()
+    loc_text = (p.get("location", "") or "").lower()
+    jd_cities = {city.lower() for city in target.get("cities", [])}
+
+    if country == (target.get("country", "") or "").lower():
+        if any(city in loc_text for city in jd_cities):
+            base = 1.00
+        elif any(city in loc_text for city in _WELCOME_CITIES):
+            base = 0.85
+        else:
+            base = 0.65
     elif s.get("willing_to_relocate"):
-        score += 0.25
+        base = 0.45
+    else:
+        base = 0.20
 
     mode = (s.get("preferred_work_mode", "") or "").lower()
-    if target.get("remote_ok") and mode in {"flexible", "remote", "hybrid"}:
-        score += 0.25
-    elif mode == "flexible":
-        score += 0.15
-    return _clamp(score)
+    if mode in {"hybrid", "flexible", "onsite"}:
+        mode_s = 1.0
+    elif mode == "remote":
+        mode_s = 0.5   # JD is hybrid — pure remote is a mismatch
+    else:
+        mode_s = 0.7   # unstated
+    return _clamp(base * 0.80 + mode_s * 0.20)
 
 
 def score_availability(c: Dict) -> float:

@@ -430,6 +430,101 @@ def test_depth_bonus_threshold_boundary():
     assert rank._search_depth_bonus(at) == pytest.approx(0.08)
 
 
+# ─── P9: JD negative signals + city-tier location ─────────────────────────────
+
+def test_title_chaser_flagged():
+    """3 short climbing stints behind the current role → title-chaser penalty."""
+    cand = _strong_candidate()
+    cand["career_history"] = [
+        {"company": "Now Inc", "title": "Principal Engineer", "duration_months": 6,
+         "is_current": True, "industry": "Software", "description": "Ranking work."},
+        {"company": "C3", "title": "Staff Engineer", "duration_months": 16,
+         "is_current": False, "industry": "Software", "description": "Backend."},
+        {"company": "C2", "title": "Senior Engineer", "duration_months": 18,
+         "is_current": False, "industry": "Software", "description": "Backend."},
+        {"company": "C1", "title": "Software Engineer", "duration_months": 15,
+         "is_current": False, "industry": "Software", "description": "Backend."},
+    ]
+    coverage = rank.concept_coverage(cand, rank.JOB_DESCRIPTION)
+    _, flags = rank.score_career(cand, coverage)
+    assert "title-chaser" in flags
+
+
+def test_long_tenure_not_flagged_as_title_chaser():
+    cand = _strong_candidate()  # one 36-month current role
+    coverage = rank.concept_coverage(cand, rank.JOB_DESCRIPTION)
+    _, flags = rank.score_career(cand, coverage)
+    assert "title-chaser" not in flags
+
+
+@pytest.mark.parametrize("skills,expected_flag", [
+    ([{"name": "Kaldi"}, {"name": "ASR"}], "speech-only"),
+    ([{"name": "SLAM"}, {"name": "ROS"}], "robotics-only"),
+    ([{"name": "OpenCV"}, {"name": "YOLO"}], "cv-only"),
+])
+def test_out_of_domain_specialists_flagged(skills, expected_flag):
+    cand = _strong_candidate()
+    cand["profile"]["summary"] = "Engineer."
+    cand["profile"]["headline"] = "Engineer"
+    cand["profile"]["current_title"] = "Engineer"
+    cand["career_history"] = [{
+        "company": "Acme", "title": "Engineer", "duration_months": 48,
+        "is_current": True, "industry": "Software",
+        "description": "Built specialised perception/audio/robotics pipelines.",
+    }]
+    cand["skills"] = [
+        {**sk, "proficiency": "expert", "duration_months": 36, "endorsements": 10}
+        for sk in skills
+    ]
+    coverage = rank.concept_coverage(cand, rank.JOB_DESCRIPTION)
+    _, flags = rank.score_career(cand, coverage)
+    assert expected_flag in flags
+
+
+def test_speech_specialist_with_retrieval_depth_not_flagged():
+    """The JD escape hatch: domain skills WITH NLP/IR depth are fine."""
+    cand = _strong_candidate()
+    cand["skills"] += [
+        {"name": "Kaldi", "proficiency": "expert", "duration_months": 36, "endorsements": 10},
+        {"name": "ASR", "proficiency": "expert", "duration_months": 36, "endorsements": 10},
+    ]
+    coverage = rank.concept_coverage(cand, rank.JOB_DESCRIPTION)
+    _, flags = rank.score_career(cand, coverage)
+    assert not any(f.endswith("-only") for f in flags)
+
+
+def _located(city, country="India", mode="hybrid", relocate=False):
+    c = _strong_candidate()
+    c["profile"]["location"] = city
+    c["profile"]["country"] = country
+    c["redrob_signals"]["preferred_work_mode"] = mode
+    c["redrob_signals"]["willing_to_relocate"] = relocate
+    return c
+
+
+def test_location_city_tiers_ordered():
+    jd = rank.JOB_DESCRIPTION
+    pune = rank.score_location(_located("Pune, Maharashtra"), jd)
+    hyd = rank.score_location(_located("Hyderabad, Telangana"), jd)
+    jaipur = rank.score_location(_located("Jaipur, Rajasthan"), jd)
+    abroad_reloc = rank.score_location(_located("Toronto", "Canada", relocate=True), jd)
+    abroad = rank.score_location(_located("Toronto", "Canada"), jd)
+    assert pune > hyd > jaipur > abroad_reloc > abroad
+
+
+def test_remote_preference_scores_below_hybrid():
+    jd = rank.JOB_DESCRIPTION
+    hybrid = rank.score_location(_located("Pune", mode="hybrid"), jd)
+    remote = rank.score_location(_located("Pune", mode="remote"), jd)
+    assert hybrid > remote
+
+
+def test_jd_block_matches_real_jd():
+    assert "Senior AI Engineer" in rank.JOB_DESCRIPTION["title"]
+    assert "experience_years_min" not in rank.JOB_DESCRIPTION  # dead config removed
+    assert rank.JOB_DESCRIPTION["location"]["cities"] == ["Pune", "Noida"]
+
+
 # ─── P11: endorsement/duration trust modifier ─────────────────────────────────
 
 def test_bare_skill_listing_gets_stuffer_discount():
