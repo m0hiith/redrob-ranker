@@ -1,0 +1,17 @@
+# Vendored model (recreate with: python download_model.py)
+models/
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+
+# OS noise
+.DS_Store
+
+# Run outputs (committed examples: smoke_out.csv only)
+run_out.csv
+submission.csv
+*.csv.tmp
+embeddings_cache.npy

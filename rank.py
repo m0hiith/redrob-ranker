@@ -27,9 +27,11 @@ from __future__ import annotations
 
 import argparse
 import csv
+import gzip
 import json
 import logging
 import math
+import os
 import re
 from collections import Counter
 from datetime import date
@@ -261,67 +263,91 @@ def _yoe_score(yoe: float) -> float:
 
 # ─── Stage 3: Semantic Search ─────────────────────────────────────────────────
 
+DEFAULT_MODEL_DIR = str(Path(__file__).parent / "models" / "bge-small-en-v1.5")
+
+# Lexical TF-IDF is for tests/smoke runs only — it does not scale to the full
+# pool (per-doc bigram vectors are multi-GB at 100K) and produces a different
+# ranking than the submitted semantic one.
+LEXICAL_MAX_CANDIDATES = 20_000
+
+
 class Embedder:
     """
     Produces semantic similarity between the JD and each candidate.
 
-    Primary path: sentence-transformers/all-MiniLM-L6-v2 (true semantic).
-    Fallback path: deterministic TF-IDF cosine over the corpus (pure stdlib),
-    so the pipeline runs offline with zero dependencies and auto-upgrades the
-    moment `sentence-transformers` is installed.
+    Loads a sentence-transformer strictly from a LOCAL directory (vendored by
+    download_model.py as a documented pre-computation step) — the ranking step
+    never touches the network, per the submission spec.
+
+    A TF-IDF lexical fallback exists for tests and small smoke runs only and
+    must be opted into explicitly (`allow_lexical_fallback=True`). Silent mode
+    degradation is forbidden: it would make the submitted ranking
+    irreproducible in the offline evaluation sandbox.
     """
 
-    def __init__(self) -> None:
+    # BGE models require an asymmetric prefix on the query side only.
+    _BGE_QUERY_PREFIX = "Represent this sentence for searching relevant passages: "
+
+    def __init__(
+        self,
+        model_dir: Optional[str] = None,
+        allow_lexical_fallback: bool = False,
+    ) -> None:
         self.mode = "lexical"
         self._model = None
         self._model_id: Optional[str] = None
         self._query_prefix: str = ""
         # None  → semantic mode loaded successfully.
-        # str   → human-readable reason(s) the neural model could not be loaded;
-        #         callers can inspect this to distinguish modes and diagnose failures.
+        # str   → human-readable reason the local model could not be loaded.
         self.load_error: Optional[str] = None
 
-        # NOTE: hosted API calls (Azure OpenAI, etc.) are banned during the ranking
-        # step by the submission spec. Only local CPU-resident models are allowed.
-        # Priority: BAAI/bge-small-en-v1.5 > all-MiniLM-L6-v2 > TF-IDF lexical.
-        # BGE models require an asymmetric prefix on the query side only.
-        _BGE_QUERY_PREFIX = "Represent this sentence for searching relevant passages: "
-        _errors: List[str] = []
-        for model_id in (
-            "BAAI/bge-small-en-v1.5",
-            "sentence-transformers/all-MiniLM-L6-v2",
-        ):
+        # Hard guarantee: no network during ranking, even if a cache is stale.
+        os.environ.setdefault("HF_HUB_OFFLINE", "1")
+        os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+
+        model_path = Path(model_dir or DEFAULT_MODEL_DIR)
+        if not (model_path / "config.json").exists():
+            self.load_error = (
+                f"local model not found at {model_path} "
+                f"(run `python download_model.py` once, with network, to vendor it)"
+            )
+        else:
             try:
                 from sentence_transformers import SentenceTransformer  # noqa: WPS433
-                self._model = SentenceTransformer(model_id)
-                self._model_id = model_id
+                self._model = SentenceTransformer(str(model_path), device="cpu")
+                self._model_id = model_path.name
                 self._query_prefix = (
-                    _BGE_QUERY_PREFIX if model_id.startswith("BAAI/bge") else ""
+                    self._BGE_QUERY_PREFIX if "bge" in model_path.name.lower() else ""
                 )
                 self.mode = "semantic"
-                logger.info("Embedder: loaded %s in semantic mode", model_id)
-                break
+                logger.info("Embedder: loaded %s from %s", model_path.name, model_path)
             except ImportError as exc:
-                # Package absent — no point trying the next model ID.
-                msg = f"sentence-transformers not installed: {exc}"
-                _errors.append(msg)
-                logger.debug("Embedder: %s — skipping all neural models", msg)
-                break
+                self.load_error = f"sentence-transformers not installed: {exc}"
             except Exception as exc:
-                # Model-specific failure (network, corrupt cache, etc.) — try next.
-                msg = f"{model_id}: {type(exc).__name__}: {exc}"
-                _errors.append(msg)
-                logger.warning("Embedder: failed to load %s — %s", model_id, exc)
+                self.load_error = f"{model_path}: {type(exc).__name__}: {exc}"
 
         if self.mode == "lexical":
-            self.load_error = "; ".join(_errors) or "sentence-transformers unavailable"
+            if not allow_lexical_fallback:
+                raise RuntimeError(
+                    "Semantic model unavailable and lexical fallback not enabled.\n"
+                    f"  Reason: {self.load_error}\n"
+                    "  Fix:    python download_model.py   (pre-computation, needs network once)\n"
+                    "  Or:     pass --allow-lexical-fallback (tests/smoke runs ONLY — "
+                    "produces a different, non-submittable ranking)."
+                )
             logger.warning(
-                "Embedder: falling back to TF-IDF lexical mode — %s", self.load_error
+                "Embedder: TF-IDF lexical mode (explicitly enabled) — %s", self.load_error
             )
 
     def similarities(self, jd_doc: str, cand_docs: List[str]) -> List[float]:
         if not cand_docs:
             return []
+        if self.mode == "lexical" and len(cand_docs) > LEXICAL_MAX_CANDIDATES:
+            raise RuntimeError(
+                f"Lexical fallback is fenced to ≤{LEXICAL_MAX_CANDIDATES} candidates "
+                f"(got {len(cand_docs)}). It exists for tests/smoke runs only — "
+                "vendor the model with `python download_model.py` for full-pool runs."
+            )
         raw = (
             self._semantic(jd_doc, cand_docs)
             if self.mode == "semantic"
@@ -1029,7 +1055,14 @@ def validate_candidate(c: object) -> Tuple[bool, List[str]]:
             "offer_acceptance_rate",
         ):
             v = signals.get(rate_key)
-            if v is not None and isinstance(v, (int, float)) and not (0.0 <= v <= 1.0):
+            # offer_acceptance_rate uses -1 as a "no offer history" sentinel (signals doc).
+            allows_sentinel = rate_key == "offer_acceptance_rate"
+            if (
+                v is not None
+                and isinstance(v, (int, float))
+                and not (0.0 <= v <= 1.0)
+                and not (allows_sentinel and v == -1)
+            ):
                 issues.append(f"redrob_signals.{rate_key} out of range [0, 1]: {v!r}")
         completeness = signals.get("profile_completeness_score")
         if (
@@ -1046,18 +1079,25 @@ def validate_candidate(c: object) -> Tuple[bool, List[str]]:
 
 def load_candidates(path: str) -> List[Dict]:
     p = Path(path)
-    text = p.read_text(encoding="utf-8")
-    if p.suffix.lower() == ".jsonl":
+    # Supports .json (array), .jsonl, and gzip-compressed variants (.jsonl.gz / .json.gz).
+    is_gz = p.suffix.lower() == ".gz"
+    fmt = (p.suffixes[-2].lower() if is_gz and len(p.suffixes) >= 2 else p.suffix.lower())
+    opener = (lambda: gzip.open(p, "rt", encoding="utf-8")) if is_gz \
+        else (lambda: open(p, "r", encoding="utf-8"))
+
+    if fmt == ".jsonl":
         raw: List = []
-        for ln_no, ln in enumerate(text.splitlines(), 1):
-            if not ln.strip():
-                continue
-            try:
-                raw.append(json.loads(ln))
-            except json.JSONDecodeError as exc:
-                logger.error("Line %d: JSON parse error — %s", ln_no, exc)
+        with opener() as f:
+            for ln_no, ln in enumerate(f, 1):
+                if not ln.strip():
+                    continue
+                try:
+                    raw.append(json.loads(ln))
+                except json.JSONDecodeError as exc:
+                    logger.error("Line %d: JSON parse error — %s", ln_no, exc)
     else:
-        data = json.loads(text)
+        with opener() as f:
+            data = json.load(f)
         raw = data if isinstance(data, list) else [data]
 
     valid: List[Dict] = []
@@ -1120,8 +1160,14 @@ def _print_diagnostics(results: List[Dict], n: int = 20) -> None:
 def main() -> None:
     logging.basicConfig(level=logging.WARNING, format="%(levelname)s: %(message)s")
     ap = argparse.ArgumentParser(description="Redrob Candidate Ranker")
-    ap.add_argument("--candidates", default="candidates.jsonl")
+    ap.add_argument("--candidates", default="candidates.jsonl",
+                    help=".json array, .jsonl, or gzip-compressed variant")
     ap.add_argument("--out", default="submission.csv")
+    ap.add_argument("--model-dir", default=DEFAULT_MODEL_DIR,
+                    help="Local sentence-transformer directory (vendored by download_model.py)")
+    ap.add_argument("--allow-lexical-fallback", action="store_true",
+                    help="Tests/smoke ONLY: permit TF-IDF fallback when the local model "
+                         "is missing. Produces a different, non-submittable ranking.")
     ap.add_argument("--diagnostics", action="store_true",
                     help="Print score-component breakdown table for top-20 candidates")
     args = ap.parse_args()
@@ -1131,14 +1177,17 @@ def main() -> None:
     print(f"Loaded {len(candidates)} candidates")
 
     print("Initialising embedder …")
-    embedder = Embedder()
+    embedder = Embedder(
+        model_dir=args.model_dir,
+        allow_lexical_fallback=args.allow_lexical_fallback,
+    )
     mode = embedder.mode          # "semantic" or "lexical"
     model = embedder._model_id or "TF-IDF lexical fallback"
     if mode == "semantic":
-        print(f"  ✓ Embedding mode : semantic")
+        print("  ✓ Embedding mode : semantic (offline, local model)")
         print(f"  ✓ Model          : {model}")
     else:
-        print(f"  ✗ Embedding mode : lexical (TF-IDF fallback)")
+        print("  ✗ Embedding mode : lexical (TF-IDF fallback — tests/smoke only)")
         print(f"  ✗ Fallback reason: {embedder.load_error}")
     weights_summary = " + ".join(
         f"{v:.2f}×{k[:3]}" for k, v in WEIGHTS.items()

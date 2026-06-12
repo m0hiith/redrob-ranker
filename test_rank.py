@@ -7,6 +7,7 @@ These tests use the lexical fallback embedder, so they need no model download.
 
 import json
 import math
+import os
 import sys
 from unittest.mock import MagicMock, patch
 
@@ -16,6 +17,10 @@ import rank
 
 
 # ─── Fixtures ─────────────────────────────────────────────────────────────────
+
+def _lexical_embedder() -> rank.Embedder:
+    """Deterministic TF-IDF embedder for tests — no model files needed."""
+    return rank.Embedder(model_dir="/nonexistent-model-dir", allow_lexical_fallback=True)
 
 def _signals(**overrides):
     base = {
@@ -194,7 +199,7 @@ def test_honeypot_sorted_below_legitimate():
     fake["redrob_signals"] = _signals(recruiter_response_rate=1.0,
                                       profile_completeness_score=100)
     results = rank.rank_candidates(
-        [fake, _strong_candidate()], rank.JOB_DESCRIPTION, rank.Embedder()
+        [fake, _strong_candidate()], rank.JOB_DESCRIPTION, _lexical_embedder()
     )
     # The legit candidate must outrank the honeypot despite its inflated signals.
     assert results[0]["candidate_id"] == "C_STRONG"
@@ -210,7 +215,7 @@ def test_honeypot_score_suppressed_to_zero_single_candidate():
     fake["candidate_id"] = "C_FAKE_SOLO"
     fake["profile"]["years_of_experience"] = 1.0
     fake["skills"][0]["duration_months"] = 120  # hard flag: skill tenure > yoe
-    results = rank.rank_candidates([fake], rank.JOB_DESCRIPTION, rank.Embedder())
+    results = rank.rank_candidates([fake], rank.JOB_DESCRIPTION, _lexical_embedder())
     assert results[0]["score"] == 0.0
     assert results[0]["reasoning"].startswith("HONEYPOT")
 
@@ -266,14 +271,14 @@ def test_strong_candidate_has_no_negative_flags():
 # ─── Stage 3: Semantic search ─────────────────────────────────────────────────
 
 def test_semantic_scores_in_unit_range():
-    emb = rank.Embedder()
+    emb = _lexical_embedder()
     sims = emb.similarities("ranking retrieval embeddings", ["ranking retrieval", "cooking food"])
     assert all(0.0 <= s <= 1.0 for s in sims)
     assert sims[0] > sims[1]  # relevant doc scores above irrelevant
 
 
 def test_relevant_candidate_scores_higher_semantically():
-    emb = rank.Embedder()
+    emb = _lexical_embedder()
     jd = rank.jd_document(rank.JOB_DESCRIPTION)
     relevant = rank.candidate_document(_strong_candidate())
     irrelevant = rank.candidate_document({
@@ -298,7 +303,7 @@ def test_subscores_in_unit_range(fn):
 
 def test_pipeline_output_shape():
     results = rank.rank_candidates(
-        [_strong_candidate()], rank.JOB_DESCRIPTION, rank.Embedder()
+        [_strong_candidate()], rank.JOB_DESCRIPTION, _lexical_embedder()
     )
     assert {"candidate_id", "rank", "score", "reasoning"}.issubset(results[0].keys())
     assert results[0]["rank"] == 1
@@ -333,59 +338,83 @@ def test_depth_bonus_threshold_boundary():
     assert rank._search_depth_bonus(at) == pytest.approx(0.08)
 
 
-# ─── Embedder: mode detection and load_error ──────────────────────────────────
+# ─── Embedder: strict offline loading + opt-in fallback ──────────────────────
 
-def test_embedder_lexical_mode_when_package_missing():
-    """Setting sys.modules entry to None simulates the package not being installed."""
-    with patch.dict(sys.modules, {"sentence_transformers": None}):
-        emb = rank.Embedder()
+def test_embedder_raises_when_model_missing_and_no_fallback(tmp_path):
+    """Missing local model + no opt-in → hard error, never a silent mode change."""
+    with pytest.raises(RuntimeError, match="download_model.py"):
+        rank.Embedder(model_dir=str(tmp_path / "nope"))
+
+
+def test_embedder_lexical_mode_requires_explicit_opt_in(tmp_path):
+    emb = rank.Embedder(model_dir=str(tmp_path / "nope"), allow_lexical_fallback=True)
     assert emb.mode == "lexical"
     assert emb._model is None
     assert emb._model_id is None
     assert emb.load_error is not None
+    assert "not found" in emb.load_error
+
+
+def test_embedder_lexical_mode_when_package_missing(tmp_path):
+    """Model dir exists but the package is absent → fallback only when opted in."""
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+    (model_dir / "config.json").write_text("{}")
+    with patch.dict(sys.modules, {"sentence_transformers": None}):
+        emb = rank.Embedder(model_dir=str(model_dir), allow_lexical_fallback=True)
+    assert emb.mode == "lexical"
     assert "sentence-transformers" in emb.load_error.lower()
 
 
-def test_embedder_lexical_mode_when_model_load_fails():
-    """Package present but SentenceTransformer() raises — falls back to lexical."""
+def test_embedder_lexical_mode_when_model_load_fails(tmp_path):
+    """Package present but SentenceTransformer() raises — opt-in fallback engages."""
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+    (model_dir / "config.json").write_text("{}")
     mock_st = MagicMock()
-    mock_st.SentenceTransformer.side_effect = OSError("simulated download failure")
+    mock_st.SentenceTransformer.side_effect = OSError("simulated corrupt model")
     with patch.dict(sys.modules, {"sentence_transformers": mock_st}):
-        emb = rank.Embedder()
+        emb = rank.Embedder(model_dir=str(model_dir), allow_lexical_fallback=True)
     assert emb.mode == "lexical"
-    assert emb.load_error is not None
-    # Error message must contain the model ID and exception details.
     assert "OSError" in emb.load_error
-    assert "simulated download failure" in emb.load_error
+    assert "simulated corrupt model" in emb.load_error
 
 
-def test_embedder_semantic_mode_clears_load_error():
-    """Successful model load → load_error is None and mode is 'semantic'."""
+def test_embedder_semantic_mode_clears_load_error(tmp_path):
+    """Successful local model load → load_error is None and mode is 'semantic'."""
+    model_dir = tmp_path / "bge-test"
+    model_dir.mkdir()
+    (model_dir / "config.json").write_text("{}")
     mock_model = MagicMock()
     mock_st = MagicMock()
     mock_st.SentenceTransformer.return_value = mock_model
     with patch.dict(sys.modules, {"sentence_transformers": mock_st}):
-        emb = rank.Embedder()
+        emb = rank.Embedder(model_dir=str(model_dir))
     assert emb.mode == "semantic"
     assert emb.load_error is None
     assert emb._model is mock_model
+    # BGE-named model dirs must apply the asymmetric query prefix.
+    assert emb._query_prefix.startswith("Represent this sentence")
+    # Loading must be pinned to the local path, never a hub model ID.
+    assert mock_st.SentenceTransformer.call_args[0][0] == str(model_dir)
 
 
-def test_embedder_import_error_does_not_retry_second_model():
-    """ImportError short-circuits the loop; SentenceTransformer is only constructed once."""
-    mock_st = MagicMock()
-    # Every SentenceTransformer(model_id) call raises ImportError.
-    mock_st.SentenceTransformer.side_effect = ImportError("no module named 'sentence_transformers'")
-    with patch.dict(sys.modules, {"sentence_transformers": mock_st}):
-        emb = rank.Embedder()
-    assert emb.mode == "lexical"
-    # ImportError must break the loop — constructor called at most once.
-    assert mock_st.SentenceTransformer.call_count <= 1
+def test_embedder_sets_offline_env_guards(tmp_path):
+    rank.Embedder(model_dir=str(tmp_path / "nope"), allow_lexical_fallback=True)
+    assert os.environ.get("HF_HUB_OFFLINE") == "1"
+    assert os.environ.get("TRANSFORMERS_OFFLINE") == "1"
+
+
+def test_lexical_fallback_fenced_above_max_candidates():
+    """The lexical path must refuse full-pool-scale input (P13 fence)."""
+    emb = _lexical_embedder()
+    docs = ["doc"] * (rank.LEXICAL_MAX_CANDIDATES + 1)
+    with pytest.raises(RuntimeError, match="fenced"):
+        emb.similarities("jd", docs)
 
 
 def test_embedder_mode_attribute_is_always_set():
-    """mode is always 'lexical' or 'semantic' — never absent or None."""
-    emb = rank.Embedder()
+    emb = _lexical_embedder()
     assert emb.mode in {"lexical", "semantic"}
 
 
