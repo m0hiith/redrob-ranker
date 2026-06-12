@@ -430,6 +430,34 @@ def test_depth_bonus_threshold_boundary():
     assert rank._search_depth_bonus(at) == pytest.approx(0.08)
 
 
+# ─── P11: endorsement/duration trust modifier ─────────────────────────────────
+
+def test_bare_skill_listing_gets_stuffer_discount():
+    """A skill with zero endorsements AND zero duration covers at 0.8, not 1.0."""
+    stuffer = _strong_candidate()
+    stuffer["skills"] = [{"name": "FAISS", "proficiency": "expert",
+                          "duration_months": 0, "endorsements": 0}]
+    stuffer["profile"]["summary"] = ""
+    stuffer["profile"]["headline"] = ""
+    stuffer["career_history"] = []
+    cov = rank.concept_coverage(stuffer, rank.JOB_DESCRIPTION)
+    assert cov["Vector Databases"] == pytest.approx(0.8)
+
+
+@pytest.mark.parametrize("evidence", [
+    {"endorsements": 5, "duration_months": 0},
+    {"endorsements": 0, "duration_months": 12},
+])
+def test_evidenced_skill_gets_full_coverage(evidence):
+    cand = _strong_candidate()
+    cand["skills"] = [{"name": "FAISS", "proficiency": "expert", **evidence}]
+    cand["profile"]["summary"] = ""
+    cand["profile"]["headline"] = ""
+    cand["career_history"] = []
+    cov = rank.concept_coverage(cand, rank.JOB_DESCRIPTION)
+    assert cov["Vector Databases"] == pytest.approx(1.0)
+
+
 # ─── P3: two-stage ranking (prescreen → semantic re-rank) ────────────────────
 
 def _junk_candidate(i: int):

@@ -276,6 +276,10 @@ _LANGCHAIN_PATTERN = _surface_pattern({"langchain"})
 PROFICIENCY = {"beginner": 0.25, "intermediate": 0.50, "advanced": 0.80, "expert": 1.00}
 _VALID_PROFICIENCIES = frozenset(PROFICIENCY)
 
+# A listed skill counts at full coverage only with usage evidence behind it.
+TRUSTED_ENDORSEMENTS = 5
+TRUSTED_DURATION_MONTHS = 12
+
 STOPWORDS = {
     "the", "a", "an", "and", "or", "of", "to", "in", "on", "for", "with", "at",
     "by", "from", "as", "is", "are", "was", "were", "be", "this", "that", "it",
@@ -524,9 +528,14 @@ def concept_coverage(c: Dict, jd: Dict) -> Dict[str, float]:
     blob = candidate_text_blob(c)
     skills_list = c.get("skills", [])
     skill_names = {s.get("name", "").lower() for s in skills_list}
-    # Map skill name → endorsement count for the boost below.
+    # Trust signals per skill (schema doc: "duration_months + endorsements are
+    # the trust signal against keyword-stuffers").
     skill_endorsements = {
         s.get("name", "").lower(): (s.get("endorsements") or 0)
+        for s in skills_list
+    }
+    skill_durations = {
+        s.get("name", "").lower(): (s.get("duration_months") or 0)
         for s in skills_list
     }
     coverage: Dict[str, float] = {}
@@ -540,10 +549,14 @@ def concept_coverage(c: Dict, jd: Dict) -> Dict[str, float]:
         hit = 0.0
         for surface in surfaces:
             if surface in skill_names:
-                hit = max(hit, 1.0)          # explicit skill = strong
-                # Endorsed skill on a core concept → extra credibility boost.
-                if skill_endorsements.get(surface, 0) >= 5:
-                    hit = min(hit + 0.10, 1.0)
+                # Explicit skill = strong, but only at full credit when backed
+                # by usage evidence. A bare listing with zero endorsements AND
+                # zero duration is exactly what keyword-stuffers produce.
+                trusted = (
+                    skill_endorsements.get(surface, 0) >= TRUSTED_ENDORSEMENTS
+                    or skill_durations.get(surface, 0) >= TRUSTED_DURATION_MONTHS
+                )
+                hit = max(hit, 1.0 if trusted else 0.8)
         if hit < 0.6 and CONCEPT_PATTERNS[req].search(blob):
             hit = max(hit, 0.6)              # mentioned in text = moderate
         coverage[req] = hit
