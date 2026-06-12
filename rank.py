@@ -92,7 +92,33 @@ WEIGHTS = {
 
 logger = logging.getLogger(__name__)
 
-REFERENCE_DATE = date.today()
+# "Today" for recency/availability math. NEVER date.today(): the Stage-3 sandbox
+# re-runs ranking on a different day, and a drifting reference date would change
+# behavioral scores → different ranking → reproduction failure. The effective
+# reference date is derived from the dataset itself (max last_active_date) via
+# derive_reference_date(), with this pinned constant as the empty-pool fallback.
+DEFAULT_REFERENCE_DATE = date(2026, 6, 1)
+
+
+def derive_reference_date(candidates: List[Dict]) -> date:
+    """
+    Deterministic "today": the max parsable last_active_date in the pool.
+
+    Same dataset → same reference date → bit-identical output, no matter when
+    or where the pipeline is re-run.
+    """
+    best: Optional[date] = None
+    for c in candidates:
+        raw = (c.get("redrob_signals") or {}).get("last_active_date")
+        if not raw or not isinstance(raw, str):
+            continue
+        try:
+            d = date.fromisoformat(raw)
+        except ValueError:
+            continue
+        if best is None or d > best:
+            best = d
+    return best or DEFAULT_REFERENCE_DATE
 
 # ─── Concept ontology ────────────────────────────────────────────────────────
 # Maps each must-have / good-to-have requirement to the skill/keyword surface
@@ -689,7 +715,7 @@ def _apply_negative_signals(
 
 # ─── Stage 5: Behavioral Signals ──────────────────────────────────────────────
 
-def score_behavioral(c: Dict) -> float:
+def score_behavioral(c: Dict, reference_date: date = DEFAULT_REFERENCE_DATE) -> float:
     """
     Recruiter-facing reliability & engagement. A strong skill match means little
     if the candidate is inactive or never responds.
@@ -716,7 +742,7 @@ def score_behavioral(c: Dict) -> float:
     last = s.get("last_active_date", "")
     if last:
         try:
-            days = (REFERENCE_DATE - date.fromisoformat(last)).days
+            days = (reference_date - date.fromisoformat(last)).days
             recency = _clamp(1.0 - days / 365)
         except ValueError:
             pass
@@ -910,7 +936,12 @@ def build_reasoning(
 
 # ─── Main Pipeline ────────────────────────────────────────────────────────────
 
-def rank_candidates(candidates: List[Dict], jd: Dict, embedder: Embedder) -> List[Dict]:
+def rank_candidates(
+    candidates: List[Dict], jd: Dict, embedder: Embedder,
+    reference_date: Optional[date] = None,
+) -> List[Dict]:
+    if reference_date is None:
+        reference_date = derive_reference_date(candidates)
     jd_doc = jd_document(jd)
     cand_docs = [candidate_document(c) for c in candidates]
     semantic_scores = embedder.similarities(jd_doc, cand_docs)
@@ -921,7 +952,7 @@ def rank_candidates(candidates: List[Dict], jd: Dict, embedder: Embedder) -> Lis
         features = engineer_features(c, jd, coverage)
 
         career, career_flags = score_career(c, coverage)
-        behavioral = score_behavioral(c)
+        behavioral = score_behavioral(c, reference_date)
         location = score_location(c, jd)
         availability = score_availability(c)
         is_honeypot, hp_reasons = detect_honeypot(c)
@@ -1197,6 +1228,9 @@ def main() -> None:
     ap.add_argument("--allow-lexical-fallback", action="store_true",
                     help="Tests/smoke ONLY: permit TF-IDF fallback when the local model "
                          "is missing. Produces a different, non-submittable ranking.")
+    ap.add_argument("--reference-date", default=None,
+                    help="Override the deterministic 'today' (YYYY-MM-DD). Default: "
+                         "max last_active_date in the pool — same data, same output.")
     ap.add_argument("--diagnostics", action="store_true",
                     help="Print score-component breakdown table for top-20 candidates")
     args = ap.parse_args()
@@ -1204,6 +1238,12 @@ def main() -> None:
     print(f"Loading: {args.candidates}")
     candidates = load_candidates(args.candidates)
     print(f"Loaded {len(candidates)} candidates")
+
+    reference_date = (
+        date.fromisoformat(args.reference_date) if args.reference_date
+        else derive_reference_date(candidates)
+    )
+    print(f"  ✓ Reference date : {reference_date} (deterministic)")
 
     print("Initialising embedder …")
     embedder = Embedder(
@@ -1224,7 +1264,7 @@ def main() -> None:
     print(f"  ✓ Score formula  : {weights_summary}")
 
     print("Ranking …")
-    results = rank_candidates(candidates, JOB_DESCRIPTION, embedder)
+    results = rank_candidates(candidates, JOB_DESCRIPTION, embedder, reference_date)
 
     hp_count = sum(1 for r in results if r["reasoning"].startswith("HONEYPOT"))
     print(f"Writing {len(results)} rows → {args.out}  ({hp_count} honeypot(s) flagged, score=0.0)")

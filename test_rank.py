@@ -338,6 +338,33 @@ def test_depth_bonus_threshold_boundary():
     assert rank._search_depth_bonus(at) == pytest.approx(0.08)
 
 
+# ─── P5: deterministic reference date ─────────────────────────────────────────
+
+def test_reference_date_derived_from_pool_max_last_active():
+    from datetime import date
+    pool = [
+        {"redrob_signals": {"last_active_date": "2026-03-10"}},
+        {"redrob_signals": {"last_active_date": "2026-05-22"}},
+        {"redrob_signals": {"last_active_date": "garbage"}},
+        {"redrob_signals": {}},
+    ]
+    assert rank.derive_reference_date(pool) == date(2026, 5, 22)
+
+
+def test_reference_date_falls_back_to_pinned_constant():
+    assert rank.derive_reference_date([]) == rank.DEFAULT_REFERENCE_DATE
+    assert rank.derive_reference_date([{"redrob_signals": {}}]) == rank.DEFAULT_REFERENCE_DATE
+
+
+def test_behavioral_score_is_reference_date_dependent_but_deterministic():
+    from datetime import date
+    c = _strong_candidate()  # last_active 2026-05-01
+    near = rank.score_behavioral(c, date(2026, 5, 2))
+    far = rank.score_behavioral(c, date(2026, 12, 1))
+    assert near > far                      # staleness must cost score
+    assert near == rank.score_behavioral(c, date(2026, 5, 2))  # deterministic
+
+
 # ─── P4: word-boundary surface matching (no substring false positives) ───────
 
 def test_research_title_gets_no_search_credit():
