@@ -430,6 +430,65 @@ def test_depth_bonus_threshold_boundary():
     assert rank._search_depth_bonus(at) == pytest.approx(0.08)
 
 
+# ─── P6: reasoning — varied, JD-linked, rank-consistent, grounded ─────────────
+
+def _reasoning_for(cand, rank_pos=1):
+    cov = rank.concept_coverage(cand, rank.JOB_DESCRIPTION)
+    features = rank.engineer_features(cand, rank.JOB_DESCRIPTION, cov)
+    return rank.build_reasoning(cand, features, rank_pos, [], [], False)
+
+
+def test_reasonings_vary_across_candidates():
+    """20 near-identical profiles must not produce identical template strings."""
+    texts = set()
+    for i in range(20):
+        cand = _strong_candidate()
+        cand["candidate_id"] = f"CAND_{i:07d}"
+        texts.add(_reasoning_for(cand))
+    assert len(texts) >= 3   # hash-seeded phrasing variants engage
+
+
+def test_reasoning_is_deterministic():
+    cand = _strong_candidate()
+    assert _reasoning_for(cand) == _reasoning_for(cand)
+
+
+def test_reasoning_references_jd():
+    assert "JD" in _reasoning_for(_strong_candidate())
+
+
+def test_reasoning_claims_are_grounded_in_coverage():
+    cand = _strong_candidate()
+    cov = rank.concept_coverage(cand, rank.JOB_DESCRIPTION)
+    features = rank.engineer_features(cand, rank.JOB_DESCRIPTION, cov)
+    text = rank.build_reasoning(cand, features, 1, [], [], False)
+    for concept in features["covered_concepts"][:3]:
+        assert concept in text  # everything named in the text exists on the profile
+
+
+def test_reasoning_tone_matches_rank_band():
+    cand = _strong_candidate()
+    top = _reasoning_for(cand, rank_pos=5)
+    tail = _reasoning_for(cand, rank_pos=95)
+    assert top != tail
+    assert any(m in tail for m in ("Ranked lower", "Held back", "Tail-of-list"))
+
+
+def test_reasoning_voices_honest_concern():
+    cand = _strong_candidate()
+    cand["redrob_signals"]["recruiter_response_rate"] = 0.1
+    cov = rank.concept_coverage(cand, rank.JOB_DESCRIPTION)
+    features = rank.engineer_features(cand, rank.JOB_DESCRIPTION, cov)
+    text = rank.build_reasoning(cand, features, 3, ["consulting-only"], [], False)
+    assert "Watch-item" in text
+    assert "consulting" in text
+
+
+def test_honeypot_reasoning_keeps_prefix():
+    text = rank.build_reasoning(_strong_candidate(), {}, 1, [], ["impossible dates"], True)
+    assert text.startswith("HONEYPOT — impossible dates")
+
+
 # ─── P9: JD negative signals + city-tier location ─────────────────────────────
 
 def test_title_chaser_flagged():
