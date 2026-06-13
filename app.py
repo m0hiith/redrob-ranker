@@ -33,12 +33,18 @@ st.caption(
 )
 
 
-@st.cache_resource
+@st.cache_resource(show_spinner="Loading embedding model (first boot only)…")
 def get_embedder() -> rank.Embedder:
-    # First boot on a fresh Space: vendor the model (allowed pre-computation).
-    import download_model
-    download_model.ensure_model()
-    return rank.Embedder()
+    # First boot on a fresh host: vendor the model (allowed pre-computation),
+    # then load it in semantic mode. If torch / the model can't load on this
+    # host, degrade to the lexical fallback so the demo still works (clearly
+    # flagged in the UI) rather than crashing the whole app.
+    try:
+        import download_model
+        download_model.ensure_model()
+        return rank.Embedder()
+    except Exception:
+        return rank.Embedder(allow_lexical_fallback=True)
 
 
 uploaded = st.file_uploader("Candidate sample", type=["json", "jsonl"])
@@ -61,9 +67,20 @@ if uploaded is not None:
         )
         candidates = candidates[:MAX_SANDBOX_CANDIDATES]
 
+    embedder = get_embedder()
+    if embedder.mode == "semantic":
+        st.caption(f"Semantic stage: {embedder._model_id} · CPU · offline.")
+    else:
+        st.warning(
+            "Running in lightweight **lexical** mode on this host — the "
+            "bge-small-en-v1.5 model isn't loaded here. The full submission "
+            "ranks with semantic embeddings (see the repo / reproduce command); "
+            "this hosted demo shows the same pipeline with a TF-IDF semantic stage."
+        )
+
     with st.spinner(f"Ranking {len(candidates)} candidates…"):
         results = rank.rank_candidates(
-            candidates, rank.JOB_DESCRIPTION, get_embedder()
+            candidates, rank.JOB_DESCRIPTION, embedder
         )
 
     st.success(f"Ranked {len(results)} candidates.")

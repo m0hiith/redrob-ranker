@@ -1,9 +1,17 @@
 # Core pipeline — all models are local (no hosted API calls permitted during ranking).
-# Versions pinned exactly for Stage-3 reproducibility. CPU-only torch is sufficient
-# (and required: the spec bans GPU during ranking).
+# Versions pinned exactly for Stage-3 reproducibility.
+#
+# CPU-only torch is required (the spec bans GPU during ranking). On Linux we pull
+# the explicit CPU wheel from PyTorch's CPU index so the install does NOT drag in
+# ~5 GB of unused CUDA runtime (nvidia-*, triton). That bloat is what exhausts the
+# hosted Streamlit sandbox's disk and triggers "spawn error" on redeploys. macOS
+# wheels are CPU-only already, so the plain pin is used there.
+#
 # Pre-computation (network, once): python download_model.py  → vendors the embedding
 # model into ./models/bge-small-en-v1.5; ranking then runs fully offline.
+--extra-index-url https://download.pytorch.org/whl/cpu
 sentence-transformers==5.5.1
 transformers==5.12.0
-torch==2.12.0
+torch==2.12.0 ; sys_platform == "darwin"
+torch==2.12.0+cpu ; sys_platform == "linux"
 numpy==2.4.6
