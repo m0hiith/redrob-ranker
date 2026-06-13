@@ -118,10 +118,18 @@ sorted below every legitimate candidate, reasoning prefixed `HONEYPOT —`.
 Same data ⇒ byte-identical CSV, any day, any machine:
 - the reference date for recency math is **derived from the dataset**
   (max `last_active_date`, 2026-05-27 for this pool), never `date.today()`;
-- cosine similarities are **cached** in `similarity_cache/` on first run
-  (keyed by a SHA-256 of the finalist IDs). Subsequent runs — and Stage-3
-  evaluation — load identical float64 values, eliminating BLAS non-determinism
-  from PyTorch's parallel matmul on Apple Silicon. Cache hit: embed step 0 s;
+- cosine similarities are **cached** in `similarity_cache/` on first run,
+  keyed by a SHA-256 **fingerprint of the embedding model, the JD text, and the
+  ordered candidate documents** — so a changed JD, a swapped model, or an edited
+  profile yields a new key and can never read a stale value. Subsequent runs —
+  and Stage-3 evaluation — load identical float64 values, eliminating BLAS
+  non-determinism from PyTorch's parallel matmul on Apple Silicon. Cache hit:
+  embed step 0 s. (Pre-fingerprint caches keyed on candidate IDs alone are still
+  read for backward compatibility and migrated on load.) Pass `--no-cache` to
+  recompute from the model and bypass the cache entirely;
+- the JD's concept surface forms are emitted in **sorted** order, so the
+  embedded text — and therefore the scores — are identical regardless of
+  `PYTHONHASHSEED`;
 - the model loads from a local vendored directory with `HF_HUB_OFFLINE=1` —
   the ranking step cannot touch the network, and a missing model is a hard
   error, never a silent algorithm change;

@@ -368,9 +368,13 @@ def _yoe_score(yoe: float) -> float:
 
 DEFAULT_MODEL_DIR = str(Path(__file__).parent / "models" / "bge-small-en-v1.5")
 
-# Cosine-similarity cache: on first run with a given finalist set, we save the
-# similarities to a committed directory so subsequent runs (including Stage-3
-# evaluation) load identical float64 values — eliminating BLAS non-determinism.
+# Cosine-similarity cache: the first run for a given (model, JD, ordered
+# candidate-text) fingerprint saves the similarities to a committed directory so
+# subsequent runs (including Stage-3 evaluation) load identical float64 values —
+# eliminating BLAS non-determinism. The fingerprint is what makes the read safe:
+# a changed JD, a swapped model, or an edited profile produces a different key,
+# so a stale value can never be served as if it were live. See
+# _load_or_compute_similarities for the (validated + legacy-compatible) logic.
 SIMILARITY_CACHE_DIR = Path(__file__).parent / "similarity_cache"
 
 # Lexical TF-IDF is for tests/smoke runs only — it does not scale to the full
@@ -528,10 +532,13 @@ def jd_document(jd: Dict) -> str:
     parts = [jd["title"]]
     parts += jd["responsibilities"]
     for req in jd["must_have"]:
-        surfaces = " ".join(CONCEPTS.get(req, set()))
+        # sorted(): CONCEPTS values are sets, whose iteration order is randomized
+        # per process (PYTHONHASHSEED). Sorting keeps the embedded JD text — and
+        # therefore the similarity scores — reproducible across runs and machines.
+        surfaces = " ".join(sorted(CONCEPTS.get(req, set())))
         parts += [f"{req} {surfaces}".strip()] * 2
     for req in jd["good_to_have"]:
-        surfaces = " ".join(CONCEPTS.get(req, set()))
+        surfaces = " ".join(sorted(CONCEPTS.get(req, set())))
         parts.append(f"{req} {surfaces}".strip())
     return ". ".join(parts)
 
@@ -1290,11 +1297,113 @@ def prescreen(
     return [c for _, _, c in ranked[:finalists]]
 
 
+def _similarity_fingerprint(
+    model_id: Optional[str], query_prefix: str, jd_doc: str, cand_docs: List[str],
+) -> str:
+    """
+    Content address for a similarity computation. Captures EVERYTHING the cached
+    scores depend on — the embedding model, its query prefix, the JD text, and
+    every candidate document *in order* — so a changed JD, a swapped model, or an
+    edited profile can never silently read a stale cache entry. Order is part of
+    the key because scores are consumed positionally against the finalist pool.
+    """
+    h = hashlib.sha256()
+    for part in (model_id or "lexical", query_prefix, jd_doc, str(len(cand_docs))):
+        h.update(part.encode("utf-8"))
+        h.update(b"\x00")
+    for doc in cand_docs:
+        h.update(doc.encode("utf-8"))
+        h.update(b"\x00")
+    return h.hexdigest()
+
+
+def _save_similarity_cache(
+    cache_file: Path, scores: List[float], fingerprint: str,
+) -> None:
+    import numpy as np
+    try:
+        SIMILARITY_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        np.savez(
+            str(cache_file),
+            scores=np.asarray(scores, dtype=np.float64),
+            fingerprint=np.asarray(fingerprint),
+        )
+        logger.info("Saved validated similarity cache %s", cache_file.name)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Could not write similarity cache %s: %s", cache_file.name, exc)
+
+
+def _load_or_compute_similarities(
+    embedder: Embedder, jd_doc: str, cand_docs: List[str],
+    finalist_ids: List[str], *, use_cache: bool = True,
+) -> List[float]:
+    """
+    Return semantic similarities for the finalist pool, preferring a cached value
+    only when it provably matches the current (model, JD, ordered candidate-text)
+    fingerprint. ``use_cache=False`` forces a fresh model pass with no read or
+    write — used by self-checks to prove the model reproduces the committed
+    values rather than trusting the shipped cache bytes.
+    """
+    import numpy as np
+
+    fingerprint = _similarity_fingerprint(
+        embedder._model_id, embedder._query_prefix, jd_doc, cand_docs,
+    )
+    cache_file = SIMILARITY_CACHE_DIR / f"sem_{fingerprint[:32]}.npz"
+
+    if use_cache and cache_file.exists():
+        try:
+            data = np.load(str(cache_file))
+            if data["fingerprint"].item() == fingerprint:
+                logger.info("Loaded validated similarity cache %s", cache_file.name)
+                return data["scores"].tolist()
+            logger.warning(
+                "Cache fingerprint mismatch at %s — recomputing", cache_file.name,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Could not read cache %s: %s — recomputing", cache_file.name, exc,
+            )
+
+    # Backward compatibility: the original cache keyed on candidate IDs only and
+    # stored a bare float64 array (no fingerprint). Honour those committed files
+    # so a frozen submission stays byte-identical without a recompute, but migrate
+    # to a validated entry and warn that the legacy key alone cannot detect a
+    # changed model / JD / candidate text.
+    if use_cache:
+        legacy_key = hashlib.sha256("|".join(finalist_ids).encode()).hexdigest()[:20]
+        legacy_file = SIMILARITY_CACHE_DIR / f"sem_{legacy_key}.npy"
+        if legacy_file.exists():
+            scores = np.load(str(legacy_file)).tolist()
+            # The legacy array is positional against the finalist pool. The ID
+            # key guarantees the same set (hence length), but guard anyway: a
+            # length mismatch means the array can't be trusted positionally, so
+            # recompute rather than mis-attribute scores to candidates.
+            if len(scores) == len(cand_docs):
+                logger.warning(
+                    "Loaded LEGACY similarity cache %s (keyed on candidate IDs "
+                    "only — not validated against model/JD/text); migrating to %s.",
+                    legacy_file.name, cache_file.name,
+                )
+                _save_similarity_cache(cache_file, scores, fingerprint)
+                return scores
+            logger.warning(
+                "Ignoring legacy cache %s: %d scores for %d candidates — recomputing.",
+                legacy_file.name, len(scores), len(cand_docs),
+            )
+
+    scores = embedder.similarities(jd_doc, cand_docs)
+    if use_cache:
+        _save_similarity_cache(cache_file, scores, fingerprint)
+    return scores
+
+
 def rank_candidates(
     candidates: List[Dict], jd: Dict, embedder: Embedder,
     reference_date: Optional[date] = None,
     finalists: int = PRESCREEN_FINALISTS,
     show_timings: bool = False,
+    use_cache: bool = True,
 ) -> List[Dict]:
     if reference_date is None:
         reference_date = derive_reference_date(candidates)
@@ -1304,29 +1413,17 @@ def rank_candidates(
     pool = prescreen(candidates, jd, reference_date, finalists)
     t_screen = time.perf_counter() - t0
 
-    # Stage B: true semantic similarity for finalists only.
-    # Similarities are cached to eliminate BLAS non-determinism across runs:
-    # the first run saves float64 values; subsequent runs (and Stage-3 eval)
-    # load identical bytes, guaranteeing byte-identical CSV output.
+    # Stage B: true semantic similarity for finalists only. Similarities are
+    # cached behind a fingerprint of (model, JD, ordered candidate text) so runs
+    # are byte-identical without ever serving a stale value when those inputs
+    # change. See _load_or_compute_similarities.
     t0 = time.perf_counter()
     jd_doc = jd_document(jd)
     cand_docs = [candidate_document(c) for c in pool]
     finalist_ids = sorted(c.get("candidate_id", "") for c in pool)
-    cache_key = hashlib.sha256("|".join(finalist_ids).encode()).hexdigest()[:20]
-    cache_file = SIMILARITY_CACHE_DIR / f"sem_{cache_key}.npy"
-    if cache_file.exists():
-        import numpy as np
-        semantic_scores = np.load(str(cache_file)).tolist()
-        logger.info("Loaded cached similarities from %s", cache_file)
-    else:
-        semantic_scores = embedder.similarities(jd_doc, cand_docs)
-        try:
-            import numpy as np
-            SIMILARITY_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-            np.save(str(cache_file), np.array(semantic_scores, dtype=np.float64))
-            logger.info("Saved similarity cache to %s", cache_file)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Could not write similarity cache: %s", exc)
+    semantic_scores = _load_or_compute_similarities(
+        embedder, jd_doc, cand_docs, finalist_ids, use_cache=use_cache,
+    )
     t_embed = time.perf_counter() - t0
 
     t0 = time.perf_counter()
@@ -1641,6 +1738,11 @@ def main() -> None:
                     help="Stage-A prescreen size handed to semantic re-ranking")
     ap.add_argument("--diagnostics", action="store_true",
                     help="Print score-component breakdown table for top-20 candidates")
+    ap.add_argument("--no-cache", action="store_true",
+                    help="Ignore the similarity cache and recompute embeddings from "
+                         "the model (no read or write). Proves the model reproduces "
+                         "the committed values; note CPU BLAS may jitter the last "
+                         "few decimals vs the frozen cache.")
     args = ap.parse_args()
 
     print(f"Loading: {args.candidates}")
@@ -1675,6 +1777,7 @@ def main() -> None:
     results = rank_candidates(
         candidates, JOB_DESCRIPTION, embedder, reference_date,
         finalists=args.finalists, show_timings=True,
+        use_cache=not args.no_cache,
     )
 
     hp_count = sum(1 for r in results if r["reasoning"].startswith("HONEYPOT"))
