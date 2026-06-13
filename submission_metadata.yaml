@@ -20,7 +20,7 @@ team_members:
 # Code and reproducibility
 # ============================================================================
 github_repo: "https://github.com/m0hiith/redrob-ranker"
-sandbox_link: "https://redrob-ranker-nsmkw8ufrijgoybtbshyf3.streamlit.app/"
+sandbox_link: "https://huggingface.co/spaces/m0hiith/redrob-ranker-sandbox"
 
 reproduce_command: "python rank.py --candidates ./candidates.jsonl --out ./submission.csv"
 # Accepts .json / .jsonl / .jsonl.gz; content-sniffs the official
