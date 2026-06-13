@@ -73,7 +73,7 @@ if uploaded is not None:
              "score": r["score"], "reasoning": r["reasoning"]}
             for r in results
         ],
-        use_container_width=True,
+        width="stretch",
     )
 
     buf = io.StringIO()
