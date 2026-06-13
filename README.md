@@ -117,7 +117,11 @@ sorted below every legitimate candidate, reasoning prefixed `HONEYPOT —`.
 
 Same data ⇒ byte-identical CSV, any day, any machine:
 - the reference date for recency math is **derived from the dataset**
-  (max `last_active_date`), never `date.today()`;
+  (max `last_active_date`, 2026-05-27 for this pool), never `date.today()`;
+- cosine similarities are **cached** in `similarity_cache/` on first run
+  (keyed by a SHA-256 of the finalist IDs). Subsequent runs — and Stage-3
+  evaluation — load identical float64 values, eliminating BLAS non-determinism
+  from PyTorch's parallel matmul on Apple Silicon. Cache hit: embed step 0 s;
 - the model loads from a local vendored directory with `HF_HUB_OFFLINE=1` —
   the ranking step cannot touch the network, and a missing model is a hard
   error, never a silent algorithm change;

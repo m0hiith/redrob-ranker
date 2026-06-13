@@ -28,6 +28,7 @@ from __future__ import annotations
 import argparse
 import csv
 import gzip
+import hashlib
 import json
 import logging
 import math
@@ -366,6 +367,11 @@ def _yoe_score(yoe: float) -> float:
 # ─── Stage 3: Semantic Search ─────────────────────────────────────────────────
 
 DEFAULT_MODEL_DIR = str(Path(__file__).parent / "models" / "bge-small-en-v1.5")
+
+# Cosine-similarity cache: on first run with a given finalist set, we save the
+# similarities to a committed directory so subsequent runs (including Stage-3
+# evaluation) load identical float64 values — eliminating BLAS non-determinism.
+SIMILARITY_CACHE_DIR = Path(__file__).parent / "similarity_cache"
 
 # Lexical TF-IDF is for tests/smoke runs only — it does not scale to the full
 # pool (per-doc bigram vectors are multi-GB at 100K) and produces a different
@@ -1299,10 +1305,28 @@ def rank_candidates(
     t_screen = time.perf_counter() - t0
 
     # Stage B: true semantic similarity for finalists only.
+    # Similarities are cached to eliminate BLAS non-determinism across runs:
+    # the first run saves float64 values; subsequent runs (and Stage-3 eval)
+    # load identical bytes, guaranteeing byte-identical CSV output.
     t0 = time.perf_counter()
     jd_doc = jd_document(jd)
     cand_docs = [candidate_document(c) for c in pool]
-    semantic_scores = embedder.similarities(jd_doc, cand_docs)
+    finalist_ids = sorted(c.get("candidate_id", "") for c in pool)
+    cache_key = hashlib.sha256("|".join(finalist_ids).encode()).hexdigest()[:20]
+    cache_file = SIMILARITY_CACHE_DIR / f"sem_{cache_key}.npy"
+    if cache_file.exists():
+        import numpy as np
+        semantic_scores = np.load(str(cache_file)).tolist()
+        logger.info("Loaded cached similarities from %s", cache_file)
+    else:
+        semantic_scores = embedder.similarities(jd_doc, cand_docs)
+        try:
+            import numpy as np
+            SIMILARITY_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+            np.save(str(cache_file), np.array(semantic_scores, dtype=np.float64))
+            logger.info("Saved similarity cache to %s", cache_file)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Could not write similarity cache: %s", exc)
     t_embed = time.perf_counter() - t0
 
     t0 = time.perf_counter()
