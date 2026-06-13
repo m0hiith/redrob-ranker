@@ -1,5 +1,7 @@
-# Vendored model (recreate with: python download_model.py)
+# Vendored model (recreate with: python download_model.py).
+# Bare name also covers a local `models` symlink used during development.
 models/
+models
 
 # Python
 __pycache__/
