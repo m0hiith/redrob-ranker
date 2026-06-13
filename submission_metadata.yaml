@@ -4,23 +4,23 @@
 # ============================================================================
 # Team identity
 # ============================================================================
-team_name: "TODO-registered-team-name"
+team_name: "Talentsia"
 
 primary_contact:
-  name: "Mohith"                  # TODO: full name as registered
-  email: "mohith4558p4@gmail.com"
-  phone: "+91-TODO"
+  name: "Mohith"
+  email: "mohith4pinninti@gmail.com"
+  phone: "+91-7032116746"
 
 team_members:
-  - name: "Mohith"                # TODO: full name as registered
-    email: "mohith4558p4@gmail.com"
+  - name: "Mohith"
+    email: "mohith4pinninti@gmail.com"
     role: "ML Engineer (solo)"
 
 # ============================================================================
 # Code and reproducibility
 # ============================================================================
-github_repo: "https://github.com/TODO-username/redrob-ranker"
-sandbox_link: "https://TODO-deploy-app-py (Streamlit Cloud / HF Spaces)"
+github_repo: "https://github.com/m0hiith/redrob-ranker"
+sandbox_link: "https://TODO-deploy (Streamlit Cloud — run: streamlit run app.py)"
 
 reproduce_command: "python rank.py --candidates ./candidates.jsonl --out ./submission.csv"
 # Accepts .json / .jsonl / .jsonl.gz; content-sniffs the official
